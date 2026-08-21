@@ -4,7 +4,7 @@
 # in the repo.
 
 # Stage 1 — build the SPI jar.
-FROM maven:3.9-eclipse-temurin-17 AS spi-build
+FROM docker.io/maven:3.9-eclipse-temurin-17 AS spi-build
 WORKDIR /build
 COPY ciba-spi/pom.xml .
 COPY ciba-spi/src ./src
