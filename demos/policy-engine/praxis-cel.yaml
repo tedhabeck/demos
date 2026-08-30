@@ -1,5 +1,5 @@
 # Praxis listener for the HR demo, CEL variant. Identical to praxis.yaml except
-# the policy filter loads policy-cel.yaml (CEL PDP) instead of policy.yaml
+# the policy filter loads policy-cel.yaml (CEL PDP) instead of policy-cedar.yaml
 # (Cedar PDP). Run with:
 #
 #   GATEWAY_CONFIG=praxis-cel.yaml ./restart.sh

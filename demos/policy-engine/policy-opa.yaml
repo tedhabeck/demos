@@ -1,9 +1,9 @@
 # Policy engine config for the HR demo, OPA variant.
 #
-# Identical to policy.yaml EXCEPT the PDP backend for the search_repos
+# Identical to policy-cedar.yaml EXCEPT the PDP backend for the search_repos
 # route: this config uses OPA/Rego instead of Cedar. All three variants
 # express the same decision ("engineers read internal repos; security
-# reads any") so they are directly comparable: see policy.yaml for Cedar
+# reads any") so they are directly comparable: see policy-cedar.yaml for Cedar
 # and policy-cel.yaml for CEL. Run this variant with:
 #   GATEWAY_CONFIG=praxis-opa.yaml ./restart.sh
 #
@@ -226,7 +226,7 @@ global:
   #
   # NOTE: this config omits the `apl:` wrapper — APL terms (`pdp:` here,
   # `policy:`/`args:`/`result:` on the routes below) sit directly on the
-  # section. Both forms are accepted; see policy.yaml for the wrapped style.
+  # section. Both forms are accepted; see policy-cedar.yaml for the wrapped style.
   # ----------------------------------------------------------------
   pdp:
     - kind: opa

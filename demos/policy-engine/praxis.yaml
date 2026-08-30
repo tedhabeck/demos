@@ -19,7 +19,7 @@ filter_chains:
       - filter: mcp
 
       - filter: policy
-        config_path: ./policy.yaml
+        config_path: ./policy-cedar.yaml
         body_access: read_write
 
       - filter: router

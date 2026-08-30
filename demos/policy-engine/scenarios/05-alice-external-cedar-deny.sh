@@ -6,14 +6,15 @@
 #
 #   Layer 1 — APL gate → passes (team.engineering)
 #   Layer 2 — PDP → DENIES (engineering rule fails:
-#             visibility == "external", not "internal")
+#             visibility == "external", not "internal";
+#             violation: cedar.default_deny / cel.policy_denied / opa.policy_denied)
 #   Layers 3-4 — never reached. No token exchange. GitHub never sees
 #             the request.
 #
 # Result: HTTP 200 + JSON-RPC error code -32001 — per MCP's Tools
 # spec, gateway denials are reported as JSON-RPC errors inside HTTP
 # 200, not as HTTP 4xx. The data.violation depends on the PDP backend:
-# "cedar.default_deny" under policy.yaml (Cedar); "cel.policy_denied"
+# "cedar.default_deny" under policy-cedar.yaml (Cedar); "cel.policy_denied"
 # under policy-cel.yaml (CEL); "opa.policy_denied" under policy-opa.yaml
 # (Rego).
 

@@ -1,9 +1,9 @@
 # Praxis Policy Engine policy document for the HR demo — CEL variant.
 #
-# Identical to policy.yaml EXCEPT the PDP backend for the search_repos
+# Identical to policy-cedar.yaml EXCEPT the PDP backend for the search_repos
 # route: this config uses CEL (Common Expression Language) instead of
 # Cedar. Both express the same decision ("engineers read internal repos;
-# security reads any") — see policy.yaml for the Cedar form. Run this
+# security reads any") — see policy-cedar.yaml for the Cedar form. Run this
 # variant with:  GATEWAY_CONFIG=praxis-cel.yaml ./restart.sh
 #
 # Hot path:
@@ -208,7 +208,7 @@ global:
   # role.*, args.*, delegation.*, session.*) and returns a boolean:
   # true → allow, false (or any eval error) → fail-closed deny.
   #
-  # CEL vs Cedar (see policy.yaml for the Cedar form): reach for CEL
+  # CEL vs Cedar (see policy-cedar.yaml for the Cedar form): reach for CEL
   # when the decision is a self-contained boolean predicate authored
   # inline in the route — no external policy store, zero glue. Reach
   # for Cedar when policy lives outside the route (versioned/signed
@@ -217,7 +217,7 @@ global:
   #
   # NOTE: this config omits the `apl:` wrapper — APL terms (`pdp:` here,
   # `policy:`/`args:`/`result:` on the routes below) sit directly on the
-  # section. The engine accepts both forms; see policy.yaml for the wrapped style.
+  # section. The engine accepts both forms; see policy-cedar.yaml for the wrapped style.
   # ----------------------------------------------------------------
   pdp:
     - kind: cel
@@ -285,7 +285,7 @@ routes:
   # out-of-band (CIBA), and the approval is bound to the live amount
   # (`scope`) so it can't be replayed against a larger change. This
   # route is PDP-independent (no cedar:/cel: step), so it behaves
-  # identically under policy.yaml and policy-cel.yaml.
+  # identically under policy-cedar.yaml and policy-cel.yaml.
   - tool: adjust_compensation
     pre_invocation:
       - "require(role.hr)"
