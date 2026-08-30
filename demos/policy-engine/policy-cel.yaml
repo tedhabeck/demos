@@ -249,6 +249,44 @@ global:
 
 routes:
 
+  # ----------------------------------------------------------------
+  # get_compensation
+  # ----------------------------------------------------------------
+  # Scenarios: 01 (Bob allow), 02 (Alice deny), 03 (Eve redact),
+  #            08 (Bob taint → send_email deny), 09 (cross-principal isolation)
+  #
+  # What the policy does:
+  #   1. require(role.hr)          — only HR-role callers proceed; anyone
+  #                                  else (e.g. Alice/engineer) gets -32001
+  #                                  before any IdP call is made.
+  #   2. delegate(workday-oauth)   — exchanges the user's JWT for a
+  #                                  workday-api-scoped token (RFC 8693).
+  #                                  The Authorization header that reaches
+  #                                  the upstream MCP server is the MINTED
+  #                                  token, not the user's original JWT.
+  #   3. taint(secret, session)    — marks this session as having touched
+  #                                  secret data. The label persists in the
+  #                                  Valkey session store keyed by
+  #                                  H(subject:session_id), so a later
+  #                                  send_email in the same session is denied
+  #                                  even if the email body is clean (scenario 08).
+  #   4. run(audit-log)            — emits a structured JSON record before
+  #                                  the call reaches upstream.
+  #   5. args.ssn / result.ssn     — field-level redaction on both the request
+  #                                  body (what upstream sees) and the response
+  #                                  body (what the client sees). Callers with
+  #                                  perm.view_ssn receive the real value;
+  #                                  everyone else gets "[REDACTED]".
+  #
+  # Expected outcomes:
+  #   Bob   (role.hr, perm.view_ssn)  → 200 OK; upstream gets minted workday
+  #                                      token; SSN intact in both directions
+  #   Alice (role.engineer, no hr)    → -32001, violation=pre_invocation[0]
+  #                                      (require(role.hr)); no token exchange
+  #   Eve   (role.hr, no view_ssn)    → 200 OK; upstream sees args.ssn=
+  #                                      "[REDACTED]"; client sees result.ssn=
+  #                                      "[REDACTED]"
+  # ----------------------------------------------------------------
   - tool: get_compensation
     pre_invocation:
       - "require(role.hr)"
@@ -260,6 +298,51 @@ routes:
     result:
       ssn: "str | redact(!perm.view_ssn)"
 
+  # ----------------------------------------------------------------
+  # search_repos
+  # ----------------------------------------------------------------
+  # Scenarios: 04 (Alice internal allow), 05 (Alice external deny),
+  #            06 (Bob APL deny)
+  #
+  # What the policy does (four-layer gauntlet):
+  #   1. require(team.engineering | team.security)
+  #                              — APL coarse gate. Bob (team.hr) is
+  #                                rejected here immediately; PDP is
+  #                                never invoked and no IdP round-trip
+  #                                occurs (scenario 06, -32001).
+  #   2. cel: expr               — CEL fine-grained PDP (same decision
+  #                                expressed in Cedar in policy-cedar.yaml
+  #                                and OPA/Rego in policy-opa.yaml). A
+  #                                single boolean expression evaluated
+  #                                inline against the common attribute
+  #                                vocabulary:
+  #                                  • engineer && visibility=internal → true
+  #                                  • security (any visibility)       → true
+  #                                  • anything else                   → false
+  #                                CEL uses has() guards to avoid
+  #                                undefined-key errors on callers who
+  #                                lack the role entirely. false →
+  #                                violation=cel.policy_denied (scenario 05).
+  #   3. delegate(github-oauth)  — exchanges the user's JWT for a
+  #                                github-api-scoped token. Keycloak's
+  #                                gh-permissions-as-scope claim mapper
+  #                                injects the user's gh_permissions
+  #                                attribute as the `permissions` claim in
+  #                                the minted token.
+  #   4. permissions check       — asserts the minted token actually
+  #                                carries repo:read:internal. Fail-safe
+  #                                guard in case the IdP under-grants.
+  #
+  # Expected outcomes:
+  #   Alice (engineer, visibility=internal)  → 200 OK; upstream gets minted
+  #                                             github-api token with
+  #                                             permissions=[repo:read:internal]
+  #   Alice (engineer, visibility=external)  → -32001, violation=cel.policy_denied;
+  #                                             no token exchange; GitHub never sees
+  #                                             the request (scenario 05)
+  #   Bob   (hr, any visibility)             → -32001, violation=pre_invocation[0]
+  #                                             (APL gate); PDP not reached (scenario 06)
+  # ----------------------------------------------------------------
   - tool: search_repos
     pre_invocation:
       - "require(team.engineering | team.security)"
@@ -273,6 +356,42 @@ routes:
       - "!(delegation.granted.permissions contains 'repo:read:internal'): deny"
       - "run(audit-log)"
 
+  # ----------------------------------------------------------------
+  # send_email
+  # ----------------------------------------------------------------
+  # Scenarios: 07 (Bob PII deny), 08 (Bob taint deny),
+  #            09 (cross-principal isolation — 200 expected)
+  #
+  # What the policy does (two independent deny paths):
+  #   1. require(perm.email_send)  — only callers with the email_send
+  #                                  permission proceed.
+  #   2. run(audit-log)            — records the attempt BEFORE the
+  #                                  deny plugins run, so denied emails
+  #                                  are still on the audit trail.
+  #   3. run(pii-scan)             — walks all tool args for SSN /
+  #                                  credit-card patterns. On a match,
+  #                                  refuses with violation=pii.detected
+  #                                  (scenario 07). Content-based; fires
+  #                                  regardless of session history.
+  #   4. taint check               — inspects session.labels. If the
+  #                                  resolved subject's session was
+  #                                  previously tainted by get_compensation,
+  #                                  denies with violation=
+  #                                  session_tainted_secret even if the
+  #                                  email body is completely clean
+  #                                  (scenario 08). Taint is subject-
+  #                                  scoped: H(subject:session_id), so a
+  #                                  different user sharing the same
+  #                                  session id is NOT affected (scenario 09).
+  #
+  # Expected outcomes:
+  #   Bob (email_send, SSN in body)              → -32001, violation=pii.detected;
+  #                                                 backend never reached; audit
+  #                                                 record still emitted (scenario 07)
+  #   Bob (email_send, clean body, tainted sess) → -32001, violation=
+  #                                                 session_tainted_secret (scenario 08)
+  #   Bob (email_send, clean body, clean sess)   → 200 OK (scenario 09 baseline)
+  # ----------------------------------------------------------------
   - tool: send_email
     pre_invocation:
       - "require(perm.email_send)"
@@ -280,12 +399,38 @@ routes:
       - "run(pii-scan)"
       - "security.labels contains \"secret\": deny('external email blocked: this session accessed secret data', 'session_tainted_secret')"
 
-  # Sensitive mutating action. Small changes go straight through; an
-  # adjustment over $10K requires the requester's manager to approve
-  # out-of-band (CIBA), and the approval is bound to the live amount
-  # (`scope`) so it can't be replayed against a larger change. This
-  # route is PDP-independent (no cedar:/cel: step), so it behaves
-  # identically under policy-cedar.yaml and policy-cel.yaml.
+  # ----------------------------------------------------------------
+  # adjust_compensation
+  # ----------------------------------------------------------------
+  # Scenarios: 10 (under-threshold, no approval), 11 (over-threshold,
+  #            manager CIBA approval required)
+  #
+  # What the policy does:
+  #   1. require(role.hr)          — HR-only gate, same as get_compensation.
+  #   2. when: args.amount > 10000 — conditional human-in-the-loop. Small
+  #      require_approval(...)       adjustments (≤$10k) go straight through
+  #                                  (scenario 10, 200 OK). Larger amounts
+  #                                  trigger an OIDC CIBA out-of-band approval
+  #                                  request to the caller's manager
+  #                                  (claim.manager). The gateway suspends
+  #                                  the call with -32120 (pending, NOT a
+  #                                  deny) and polls Keycloak until the
+  #                                  manager approves or the 24h timeout
+  #                                  elapses. The approval is scoped to
+  #                                  args.amount <= 25000, so a sign-off
+  #                                  can't be replayed against a larger
+  #                                  change (scenario 11).
+  #   3. run(audit-log)            — records the attempt.
+  #
+  # No PDP step — this route behaves identically under Cedar, CEL, and OPA.
+  #
+  # Expected outcomes:
+  #   Bob (role.hr, amount=$5,000)  → 200 OK, status="applied"; no approval
+  #                                    flow triggered (scenario 10)
+  #   Bob (role.hr, amount=$25,000) → -32120 (pending); gateway polls CIBA;
+  #                                    once manager approves → 200 OK,
+  #                                    status="applied" (scenario 11)
+  # ----------------------------------------------------------------
   - tool: adjust_compensation
     pre_invocation:
       - "require(role.hr)"
