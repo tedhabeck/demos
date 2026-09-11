@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024 Praxis Contributors
 
 //! Offline transpiler from Kuadrant `AuthPolicy` resources to Praxis
@@ -33,4 +33,5 @@ pub(crate) mod cel;
 pub(crate) mod emit;
 pub(crate) mod model;
 pub(crate) mod report;
+pub(crate) mod selector;
 pub(crate) mod translate;
