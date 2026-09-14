@@ -6,3 +6,5 @@ agent/.venv/
 __pycache__/
 *.pyc
 .env
+# post deployment variables installed by provisioner
+post_deploy_variables.json

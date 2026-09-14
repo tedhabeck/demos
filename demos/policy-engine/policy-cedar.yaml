@@ -41,6 +41,13 @@ plugins:
             url: "http://localhost:8081/realms/policy-demo/protocol/openid-connect/certs"
             insecure_http: true   # localhost dev — never production
           leeway_seconds: 60
+        - issuer: "https://praxis-1.verify.ibm.com/oauth2"
+          audiences: ["praxis-gateway"]
+          algorithms: ["RS256"]
+          decoding_key:
+            kind: jwks_url
+            url: "https://praxis-1.verify.ibm.com/oauth2/jwks"
+          leeway_seconds: 60
       claim_mapper: standard
 
   # Client identity. Carries the agent's client_id / azp.
@@ -64,6 +71,13 @@ plugins:
             kind: jwks_url
             url: "http://localhost:8081/realms/policy-demo/protocol/openid-connect/certs"
             insecure_http: true   # localhost dev — never production
+          leeway_seconds: 60
+        - issuer: "https://praxis-1.verify.ibm.com/oauth2"
+          audiences: ["praxis-gateway", "account"]
+          algorithms: ["RS256"]
+          decoding_key:
+            kind: jwks_url
+            url: "https://praxis-1.verify.ibm.com/oauth2/jwks"
           leeway_seconds: 60
       claim_mapper: standard
 

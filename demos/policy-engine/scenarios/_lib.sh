@@ -10,7 +10,11 @@ GATEWAY="${GATEWAY:-http://localhost:8090}"
 DEMO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 mint() {
-  "$DEMO_DIR/mint-token.sh" "$1"
+  if [ "${USE_VERIFY:-}" = "true" ]; then
+    "$DEMO_DIR/mint-verify-token.sh" "$1"
+  else
+    "$DEMO_DIR/mint-token.sh" "$1"
+  fi
 }
 
 _print_response() {
