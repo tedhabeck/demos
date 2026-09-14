@@ -27,7 +27,6 @@ CLIENT_SECRET=$(jq -r '.variables.HR_COPILOT_CLIENT_SECRET' "$post_deploy_variab
 persona="${1:?usage: $0 <alice|bob|charlie|eve|hr-copilot>}"
 persona_pw=""
 case "$persona" in alice|bob|charlie|eve)
-   persona_pw="${1}Lab3151"
    persona_pw=$(jq -r ".variables.${1}_pw" "$post_deploy_variables")
    ;;
 esac
