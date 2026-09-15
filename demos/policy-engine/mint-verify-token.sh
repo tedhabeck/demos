@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Mint an access token for a demo persona by hitting Keycloak's
+# Mint an access token for a demo persona by hitting IBM Verify
 # direct password-grant endpoint. Echoes the raw JWT on stdout.
 #
 # Usage:
@@ -14,8 +14,7 @@
 #   charlie  — auditor, role=auditor, perms=[tool_execute, pii_access]
 #   eve      — HR, role=hr, perms=[tool_execute]   (NO view_ssn)
 #
-# Requires `jq`. Token endpoint defaults to localhost:8081 (the
-# docker-compose mapping for Keycloak).
+# Requires `jq`.  
 
 set -euo pipefail
 post_deploy_variables="post_deploy_variables.json"

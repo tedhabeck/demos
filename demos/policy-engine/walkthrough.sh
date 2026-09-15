@@ -80,13 +80,46 @@ if ! curl -fsS --max-time 2 -o /dev/null -X POST http://localhost:8090/mcp \
 fi
 echo "  $(green ✓) gateway up"
 
-beat "Can Keycloak mint a token?"
-if ! ./verify-token-exchange.sh >/dev/null 2>&1; then
-  echo "  $(yellow ✗) verify-token-exchange.sh failed"
-  echo "  $(dim "try: docker compose down -v && docker compose up -d")"
-  exit 1
+if [ "${USE_VERIFY:-}" = "true" ]; then
+  beat "Can IBM Verify mint and exchange a token?"
+  if ! ./verify-ibm-verify-token-exchange.sh >/dev/null 2>&1; then
+    echo "  $(yellow ✗) verify-ibm-verify-token-exchange.sh failed"
+    echo "  $(dim "check the tenant is reachable and post_deploy_variables.json is populated")"
+    exit 1
+  fi
+  echo "  $(green ✓) IBM Verify RFC 8693 token exchange works"
+
+  # USE_VERIFY switches only which IdP the scenarios MINT from. If the running
+  # gateway is still on a Keycloak config it rejects every Verify token at
+  # identity.resolve and all 7 scenarios fail with auth.untrusted_issuer — which
+  # reads like a policy problem. Probe it directly: send a real Verify-minted
+  # token through the gateway and look at which violation (if any) comes back.
+  beat "Is the running gateway configured for Verify?"
+  _probe=$(USE_VERIFY=true bash scenarios/01-bob-allow.sh 2>&1 || true)
+  case "$_probe" in
+    *auth.untrusted_issuer*)
+      echo "  $(yellow ✗) the gateway does not trust the Verify issuer"
+      echo "  $(dim "USE_VERIFY switches token minting only — the gateway needs its own config:")"
+      echo "  $(dim "USE_VERIFY=true GATEWAY_CONFIG=praxis-verify-opa.yaml ./restart.sh")"
+      exit 1
+      ;;
+    *delegation.idp_rejected*)
+      echo "  $(yellow ✗) the gateway trusts Verify but exchanges tokens elsewhere"
+      echo "  $(dim "a Keycloak delegator cannot exchange a Verify-minted token:")"
+      echo "  $(dim "USE_VERIFY=true GATEWAY_CONFIG=praxis-verify-opa.yaml ./restart.sh")"
+      exit 1
+      ;;
+  esac
+  echo "  $(green ✓) gateway is on the Verify path"
+else
+  beat "Can Keycloak mint a token?"
+  if ! ./verify-token-exchange.sh >/dev/null 2>&1; then
+    echo "  $(yellow ✗) verify-token-exchange.sh failed"
+    echo "  $(dim "try: docker compose down -v && docker compose up -d")"
+    exit 1
+  fi
+  echo "  $(green ✓) Keycloak STE v2 works"
 fi
-echo "  $(green ✓) Keycloak STE v2 works"
 
 beat "Tip — open a second terminal and run:"
 echo "      $(dim "docker compose logs -f hr-mcp")"
@@ -186,14 +219,23 @@ banner "Walkthrough complete"
 beat "Recap of what the gateway demonstrated:"
 echo "      $(dim "•") identity from JWT (jwt-user reads X-User-Token,"
 echo "        jwt-client reads Authorization — both validated against"
-echo "        Keycloak's live JWKS)"
+echo "        $(if [ "${USE_VERIFY:-}" = "true" ]; then printf "IBM Verify's"; else printf "Keycloak's"; fi) live JWKS)"
 echo "      $(dim "•") attribute-based APL policy (require(team.X), role.Y,"
 echo "        perm.Z) with fast-path deny semantics"
 echo "      $(dim "•") Cedar PDP for relationship-based authorization"
 echo "        (principal × resource attributes), with \${args.X}"
 echo "        substitution into the resource block"
-echo "      $(dim "•") RFC 8693 OAuth token exchange against real Keycloak"
-echo "        v2 Standard Token Exchange — per-audience minted tokens"
+if [ "${USE_VERIFY:-}" = "true" ]; then
+  # Deliberately weaker wording than the Keycloak line. Verify stamps the
+  # exchanging client's whole registered resource list on every token rather
+  # than honoring the requested audience (delta V1), so "per-audience minted
+  # tokens" would be false here.
+  echo "      $(dim "•") RFC 8693 OAuth token exchange against IBM Verify —"
+  echo "        exchanged tokens (see the V1/V2 deltas below)"
+else
+  echo "      $(dim "•") RFC 8693 OAuth token exchange against real Keycloak"
+  echo "        v2 Standard Token Exchange — per-audience minted tokens"
+fi
 echo "      $(dim "•") on-the-wire body rewriting (redact) — the tool"
 echo "        literally never sees the redacted field"
 echo "      $(dim "•") field-level plugin (PII scanner) catching content"
@@ -206,6 +248,27 @@ echo "      $(dim "•") MCP-compliant error responses: JSON-RPC error envelope"
 echo "        for application denials (HTTP 200, code -32001), HTTP 401 +"
 echo "        WWW-Authenticate for transport-level auth failures."
 echo
+if [ "${USE_VERIFY:-}" = "true" ]; then
+  beat "$(bold "Ran against IBM Verify") — the same APL policy text, a different IdP."
+  echo "      $(dim "diff policy-opa.yaml policy-verify-opa.yaml — every difference is in")"
+  echo "      $(dim "the identity and delegation blocks. Routes, PDP, redaction, PII scan,")"
+  echo "      $(dim "taint and audit are byte-identical. That diff is the argument.")"
+  echo
+  beat "Two things this path does NOT demonstrate (be straight about these):"
+  echo "      $(dim "•") V1 — Verify stamps the exchanging client's full registered"
+  echo "        resource list on every token regardless of the requested"
+  echo "        audience, and accepts an unregistered one silently. Say"
+  echo "        \"exchanged token,\" not \"audience-scoped token.\""
+  echo "      $(dim "•") V2 — layer 4 is an echo, not an entitlement check. Verify"
+  echo "        returns whatever scope was requested, so scenario 4's assertion"
+  echo "        verifies wire-shape parity, not an authorization decision. On"
+  echo "        Keycloak the same assertion IS load-bearing."
+  echo
+  beat "Also Keycloak-only: scenarios 8-12, and CIBA approval (10-11)."
+  echo "      $(dim "the tenant's clients cannot use the CIBA grant (CSIAQ5303E) and")"
+  echo "      $(dim "Verify tokens carry no manager claim. walkthrough.sh runs 1-7.")"
+  echo
+fi
 beat "To try this through an LLM, start chat.py:"
 echo "      $(dim "cd agent && python chat.py --persona bob   # or use --model")"
 echo

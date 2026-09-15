@@ -35,8 +35,20 @@ cd "$(dirname "$0")"
 
 # Which praxis config to run. Defaults to the OPA/Rego PDP (praxis-opa.yaml);
 # set GATEWAY_CONFIG=praxis.yaml or praxis-cel.yaml for the Cedar and CEL
-# PDP variants.
+# PDP variants, or praxis-verify-opa.yaml for the IBM Verify IdP path.
 GATEWAY_CONFIG="${GATEWAY_CONFIG:-praxis-opa.yaml}"
+
+# The Verify path's delegators read their client secret from the environment
+# (client_secret_source: {kind: env_var}) rather than from inline YAML, since
+# those are live tenant credentials. Source ./.env.verify when present so the
+# variable reaches the gateway process below. Gitignored; see
+# .env.verify.example.
+if [ -f .env.verify ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . ./.env.verify
+  set +a
+fi
 GATEWAY_LOG="gateway.log"
 KEYCLOAK_HOST="${KEYCLOAK_HOST:-http://localhost:8081}"
 KEYCLOAK_REALM="${KEYCLOAK_REALM:-policy-demo}"
@@ -63,6 +75,20 @@ step() { printf "\n\033[1;34m[restart-demo]\033[0m %s\n" "$*"; }
 ok()   { printf "  \033[1;32m✓\033[0m %s\n" "$*"; }
 warn() { printf "  \033[1;33m⚠\033[0m %s\n" "$*"; }
 die()  { printf "  \033[1;31m✗\033[0m %s\n" "$*"; exit 1; }
+
+# Fail fast on a Verify run with no client secret. Without this the gateway
+# starts, identity resolution succeeds, and the first scenario dies at
+# delegation.idp_rejected — which reads like a policy problem rather than a
+# missing environment variable.
+case "$GATEWAY_CONFIG" in
+  *verify*)
+    if [ -z "${VERIFY_GATEWAY_CLIENT_SECRET:-}" ]; then
+      echo "fatal: $GATEWAY_CONFIG needs VERIFY_GATEWAY_CLIENT_SECRET." >&2
+      echo "  cp .env.verify.example .env.verify   # then fill in the secret" >&2
+      exit 1
+    fi
+    ;;
+esac
 
 # 1. Kill any existing gateway on :8090.
 step "stopping any existing gateway on :8090"

@@ -8,3 +8,5 @@ __pycache__/
 .env
 # post deployment variables installed by provisioner
 post_deploy_variables.json
+# IBM Verify tenant client secret for the Verify IdP path
+.env.verify
