@@ -59,7 +59,7 @@ case "$persona" in
 esac
 
 if ! token=$(echo "$response" | jq -er '.access_token'); then
-  echo "ERROR: Keycloak did not return an access_token" >&2
+  echo "ERROR: IBM Verify did not return an access_token" >&2
   echo "$response" | jq . >&2 || echo "$response" >&2
   exit 1
 fi
