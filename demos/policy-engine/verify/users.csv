@@ -1,0 +1,57 @@
+## IBM Verify user registration source for the policy-engine demo.
+##
+## Derived from keycloak/realm-export.json — the four demo personas, their
+## realm roles, and the four custom attributes the policy configs read. Keeping
+## this as a flat CSV rather than a second realm-export.json is deliberate: the
+## Verify tenant is provisioned by API, and a CSV is the shape an operator can
+## diff, edit, or extend for their own tenant without learning SCIM.
+##
+## Column mapping onto Verify's SCIM model (see import-verify-users.sh):
+##
+##   username        -> userName
+##   email           -> emails[0].value  (type=work; Verify allows exactly one)
+##   first_name      -> name.givenName
+##   last_name       -> name.familyName
+##   password        -> password  (initial clear-text; notifyType=NONE so
+##                      Verify does not mail it to @corp.com, which does not
+##                      resolve)
+##   roles           -> customAttributes[roles]           (pipe-separated)
+##   permissions     -> customAttributes[permissions]     (pipe-separated)
+##   teams           -> customAttributes[teams]           (pipe-separated)
+##   gh_permissions  -> customAttributes[gh_permissions]  (pipe-separated)
+##
+## Multi-valued cells are pipe-separated, NOT comma-separated, so the file
+## stays valid CSV without quoting. An empty cell means "no values."
+##
+## Two notes carried over from docs/brainstorms/2026-08-31-ibm-verify-idp-requirements.md:
+##
+##   1. EMPTY-STRING PADDING IS LOAD-BEARING. Verify emits a custom attribute
+##      as a JSON scalar when it holds exactly one value, and Praxis's standard
+##      claim mapper reads roles/teams/permissions via Value::as_array — which
+##      returns None for a string, yielding an empty subject.roles with no
+##      error. That presents as a policy deny rather than a config fault. The
+##      importer appends a trailing "" to every multi-valued attribute so the
+##      claim is always array-shaped. Do not "clean up" that padding here or in
+##      the importer without first landing the upstream mapper fix.
+##
+##   2. The realm export's `groups` attribute is intentionally absent below.
+##      It duplicates `teams` for all four personas and no Verify-path policy
+##      reads it (policy-verify-opa.yaml references teams, not groups). Add a
+##      groups column here and to ATTRS in the importer if that changes.
+##
+## Passwords match post_deploy_variables.json (<persona>_pw) so mint-verify-token.sh
+## keeps working unchanged against a freshly provisioned tenant. They are lab
+## credentials for a throwaway TechZone tenant.
+##
+## Personas — the reason each one exists in the demo:
+##   alice    engineer. Baseline: tool_execute only, plus the one gh_permission
+##            that makes the scenario-4 exchange meaningful.
+##   bob      HR manager. The permissive persona — view_ssn + pii_access.
+##   charlie  auditor. pii_access WITHOUT view_ssn.
+##   eve      HR, but WITHOUT view_ssn — proves the gate is on the permission,
+##            not on the role. Eve and Bob differ only in permissions.
+username,email,first_name,last_name,password,roles,permissions,teams,gh_permissions
+alice,alice@corp.com,Alice,Engineer,aliceLab3151,engineer,tool_execute,engineering,repo:read:internal
+bob,bob@corp.com,Bob,HRManager,bobLab3151,hr,tool_execute|view_ssn|pii_access|email_send,hr,
+charlie,charlie@corp.com,Charlie,Auditor,charlieLab3151,auditor,tool_execute|pii_access,compliance,
+eve,eve@corp.com,Eve,HRWithoutSSN,eveLab3151,hr,tool_execute,hr,

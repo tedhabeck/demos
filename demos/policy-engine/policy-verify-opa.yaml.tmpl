@@ -1,12 +1,3 @@
-# GENERATED FILE — DO NOT EDIT.
-#
-# Rendered from policy-verify-opa.yaml.tmpl by render-verify-config.sh.
-# Edit the .tmpl and re-run; this file is gitignored and is overwritten on
-# every Verify run of restart.sh.
-#
-#   tenant     https://praxis-1.verify.ibm.com
-#   client_id  c619871a-6a66-45cd-b1eb-dddde1c318c2
-#
 # TEMPLATE — this file is the source; policy-verify-opa.yaml is GENERATED from it.
 #
 # Edit THIS file, never the generated one. restart.sh renders it on every Verify
@@ -21,9 +12,9 @@
 # it stays a runtime `client_secret_source: {kind: env_var}` lookup by the gateway
 # so it never lands in a rendered file on disk.
 #
-#   https://praxis-1.verify.ibm.com          e.g. https://praxis-1.verify.ibm.com
+#   ${VERIFY_TENANT_URL}          e.g. https://praxis-1.verify.ibm.com
 #                                 defaults to the tenant in post_deploy_variables.json
-#   c619871a-6a66-45cd-b1eb-dddde1c318c2   the EXCHANGE client's id (praxis-sts-1)
+#   ${VERIFY_GATEWAY_CLIENT_ID}   the EXCHANGE client's id (praxis-sts-1)
 #                                 defaults to GATEWAY_CLIENT_ID in that same file
 #
 # Both defaults mean a normal run needs no extra setup: the ids that
@@ -53,7 +44,7 @@
 #                    audience=workday-api token via Verify (RFC 8693)
 #   5. APL args      ssn arg gets redacted unless caller has perm.view_ssn
 #
-# Verify is public HTTPS at https://praxis-1.verify.ibm.com/oauth2, so no
+# Verify is public HTTPS at ${VERIFY_TENANT_URL}/oauth2, so no
 # insecure_http / loopback opt-in is needed on the IdP side. Access tokens are
 # RS256 `at+jwt` (kid: server); we point at the tenant JWKS so the resolver
 # fetches the active public key at init time.
@@ -103,12 +94,12 @@ plugins:
       # Verify stamps its full registered resource list on every token (delta
       # V1) and praxis-gateway is in it — verified on the live tenant.
       trusted_issuers:
-        - issuer: "https://praxis-1.verify.ibm.com/oauth2"
+        - issuer: "${VERIFY_TENANT_URL}/oauth2"
           audiences: ["praxis-gateway"]
           algorithms: ["RS256"]
           decoding_key:
             kind: jwks_url
-            url: "https://praxis-1.verify.ibm.com/oauth2/jwks"
+            url: "${VERIFY_TENANT_URL}/oauth2/jwks"
           leeway_seconds: 60
       claim_mapper: standard
 
@@ -127,12 +118,12 @@ plugins:
       header: Authorization
       # Verify only — same reasoning as jwt-user above.
       trusted_issuers:
-        - issuer: "https://praxis-1.verify.ibm.com/oauth2"
+        - issuer: "${VERIFY_TENANT_URL}/oauth2"
           audiences: ["praxis-gateway", "account"]
           algorithms: ["RS256"]
           decoding_key:
             kind: jwks_url
-            url: "https://praxis-1.verify.ibm.com/oauth2/jwks"
+            url: "${VERIFY_TENANT_URL}/oauth2/jwks"
           leeway_seconds: 60
       claim_mapper: standard
 
@@ -154,7 +145,7 @@ plugins:
       - read_inbound_credentials
       - write_delegated_tokens
     config:
-      token_endpoint: "https://praxis-1.verify.ibm.com/oauth2/token"
+      token_endpoint: "${VERIFY_TENANT_URL}/oauth2/token"
       # No insecure_http: Verify is public HTTPS.
       #
       # This is the EXCHANGE client, deliberately different from the client
@@ -166,7 +157,7 @@ plugins:
       # Same split as the Keycloak realm's hr-copilot mints / praxis-gateway
       # exchanges. Point both at one client and every scenario fails at
       # delegation, not at identity.
-      client_id: "c619871a-6a66-45cd-b1eb-dddde1c318c2"
+      client_id: "${VERIFY_GATEWAY_CLIENT_ID}"
       # Live tenant secret, so it is read from the environment rather than
       # tracked in git. restart.sh sources ./.env.verify when present; see
       # .env.verify.example. (`kind: literal` with an inline `secret:` is what
@@ -250,10 +241,10 @@ plugins:
       - read_inbound_credentials
       - write_delegated_tokens
     config:
-      token_endpoint: "https://praxis-1.verify.ibm.com/oauth2/token"
+      token_endpoint: "${VERIFY_TENANT_URL}/oauth2/token"
       # No insecure_http: Verify is public HTTPS.
       # The exchange client again — see the note on workday-oauth above.
-      client_id: "c619871a-6a66-45cd-b1eb-dddde1c318c2"
+      client_id: "${VERIFY_GATEWAY_CLIENT_ID}"
       client_secret_source:
         kind: env_var
         name: VERIFY_GATEWAY_CLIENT_SECRET

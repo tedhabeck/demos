@@ -87,6 +87,14 @@ case "$GATEWAY_CONFIG" in
       echo "  cp .env.verify.example .env.verify   # then fill in the secret" >&2
       exit 1
     fi
+    # policy-verify-opa.yaml is generated from policy-verify-opa.yaml.tmpl: the
+    # tenant URL and the exchange client_id are tenant-specific, and Verify
+    # GENERATES client ids, so a rebuilt tenant invalidates whatever was
+    # committed. Praxis has no env-var indirection for client_id (only for the
+    # secret), so substitution happens here, before the gateway reads the file.
+    # Rendering is idempotent and quiet when nothing changed.
+    step "rendering $GATEWAY_CONFIG's policy config from its template"
+    ./render-verify-config.sh || die "could not render policy-verify-opa.yaml"
     ;;
 esac
 
