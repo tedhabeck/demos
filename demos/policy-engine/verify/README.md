@@ -166,12 +166,38 @@ the slots the owner's tenant actually uses (it was built by hand first):
 This is harmless — the attributes already exist, so the importer skips them, and
 claim mapping resolves by `scimName` rather than by slot. It only matters if you
 provision a *fresh* tenant and then expect the slot numbers to match this one.
+The "this tenant" column above is the hand-built `praxis-1`; a tenant the
+importer provisions from scratch (e.g. `praxis-2`) gets the importer's slots.
 
-**`gh_permissions` has `scimName` `ghpermissions`** — no underscore — on this
-tenant. The CELx mappers call `user.getCustomValues("<scimName>")`, so a mapper
-written against the display name yields nothing and scenario 4 loses its
-permissions claim silently. `import-verify-clients.sh` resolves each scimName
-from the tenant rather than assuming; `--discover` prints the mapping.
+**`gh_permissions` has `scimName` `ghpermissions`** — no underscore. This is not
+a quirk of one hand-built tenant: Verify's `scimName`/`attributeName` validator
+accepts **letters only**, and rejects anything else with
+
+```
+400  CSIAI0096E  The value gh_permissions is not valid for attribute [scimName].
+```
+
+Note that is a 400 *without* the word "exists", so it is not the idempotent
+already-defined case. `import-verify-users.sh` therefore carries the scimName as
+the third field of each `ATTRS` entry (`displayName:slot:scimName`) and uses it
+for both the attribute definition and the `customAttributes` entries in each
+user's SCIM payload — the display name keeps the underscore, the wire never sees
+it. Adding a new attribute whose name is not purely alphabetic means giving it a
+letters-only scimName there.
+
+The CELx mappers call `user.getCustomValues("<scimName>")`, so a mapper written
+against the display name yields nothing and scenario 4 loses its permissions
+claim silently. `import-verify-clients.sh` resolves each scimName from the
+tenant rather than assuming; `--discover` prints the mapping.
+
+Two other tenant constraints the importer encodes, both discovered the same way:
+
+- **`emailVerified` is not accepted** in the IBM user extension —
+  `CSIAI0111E The supplied JSON contained an invalid attribute: emailVerified`.
+  It is also unnecessary; `notifyType: NONE` is what suppresses the
+  account-created mail to the non-resolving `@corp.com` addresses.
+- A user create returning **201 does not prove the attributes stored**. Read the
+  user back and check `customAttributes` before trusting a fresh tenant.
 
 The realm export's `groups` attribute is deliberately not carried over: it
 duplicates `teams` for all four personas and no Verify-path policy reads it.

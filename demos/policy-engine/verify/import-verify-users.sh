@@ -163,14 +163,27 @@ get_token() {
   ok "admin token" "$(dim "client ${ADMIN_ID:0:8}…")"
 }
 
-# api <METHOD> <PATH> [BODY] -> prints "<http_status>\n<body>"
+# api <METHOD> <PATH> [BODY] -> prints "<body>\n<http_status>"
+#
+# The two APIs this script talks to do NOT share a media type, and getting it
+# wrong is a 406 rather than a helpful error:
+#
+#   /v2.0/Users      SCIM  -> application/scim+json
+#   /v1.0/attributes plain -> application/json
+#
+# The Attributes API rejects scim+json in Accept with "406 Not Acceptable"
+# before it ever looks at the body, so send each endpoint the type it declares.
 api() {
   local method="$1" path="$2" body="${3:-}"
+  local ctype="application/json"
+  case "$path" in
+    /v2.0/*) ctype="application/scim+json; charset=utf-8" ;;
+  esac
   local -a args=(-sS -o - -w $'\n%{http_code}' -X "$method" "${TENANT_URL}${path}"
     -H "Authorization: Bearer $ACCESS_TOKEN"
-    -H "Accept: application/scim+json; charset=utf-8")
+    -H "Accept: $ctype")
   if [ -n "$body" ]; then
-    args+=(-H "Content-Type: application/scim+json; charset=utf-8" -d "$body")
+    args+=(-H "Content-Type: $ctype" -d "$body")
   fi
   curl "${args[@]}"
 }
@@ -181,6 +194,36 @@ _split_resp() {
   RESP_BODY="${1%$'\n'*}"
 }
 
+# ==========================================================================
+# 1. Custom attribute definitions
+# ==========================================================================
+# A custom attribute must exist in the TENANT SCHEMA before a user payload may
+# carry it — an undefined attribute fails the create with a validation error
+# rather than being created implicitly. Each definition claims one of the
+# predefined customAttribute1..150 slots.
+#
+# datatype string[] is what keeps these multi-valued. The slot numbers are
+# arbitrary but must be stable: changing one after users exist orphans the
+# stored values.
+#
+# Verify's scimName validator accepts LETTERS ONLY — an underscore or hyphen is
+# rejected with "CSIAI0096E The value <x> is not valid for attribute [scimName]"
+# (a 400 that is NOT an "already exists" 400). So the display name and the
+# scimName have to be allowed to differ: gh_permissions -> ghpermissions.
+#
+# The scimName is the operative one — the CELx claim mappers call
+# user.getCustomValues("<scimName>"), and import-verify-clients.sh resolves it
+# from the tenant rather than assuming name == scimName. Keep this in sync with
+# that script and with verify/README.md.
+#
+# Format: displayName:slot:scimName
+ATTRS=(
+  "roles:customAttribute1:roles"
+  "permissions:customAttribute2:permissions"
+  "teams:customAttribute3:teams"
+  "gh_permissions:customAttribute4:ghpermissions"
+)
+
 # --- CSV -> JSON ----------------------------------------------------------
 # Parsed with python3's csv module rather than IFS=, read: it handles quoting
 # and CRLF correctly, and it lets the '##' comment convention in users.csv work.
@@ -190,13 +233,22 @@ _split_resp() {
 # Multi-valued cells are pipe-separated (see users.csv), and each list gets the
 # trailing "" pad described in the header comment.
 csv_json() {
-  python3 - "$CSV" <<'PY'
+  # Build "csvName=scimName,..." from ATTRS so the two never drift apart.
+  local entry map=""
+  for entry in "${ATTRS[@]}"; do
+    map+="${entry%%:*}=${entry##*:},"
+  done
+  python3 - "$CSV" "${map%,}" <<'PY'
 import csv, json, sys
 
 REQUIRED = ["username", "email", "first_name", "last_name", "password"]
-# Custom attributes, in the order they are emitted. Keep in sync with ATTRS in
-# the shell below and with the claim mappers on the Verify tenant's clients.
-ATTRS = ["roles", "permissions", "teams", "gh_permissions"]
+
+# Custom attributes, in the order they are emitted. The CSV column keeps the
+# readable name (gh_permissions); the SCIM payload must use the tenant's
+# scimName, which is letters-only (ghpermissions). The map arrives as
+# "csvName=scimName,..." in argv[2] so ATTRS in the shell below stays the single
+# source of truth for that pairing.
+ATTR_MAP = [tuple(pair.split("=", 1)) for pair in sys.argv[2].split(",") if pair]
 
 with open(sys.argv[1], newline="") as fh:
     # '##' lines are documentation, not data. Blank lines are skipped so the
@@ -225,13 +277,13 @@ for i, row in enumerate(reader, start=2):
                  f"mint-verify-token.sh needs one to use the password grant")
 
     attrs = {}
-    for name in ATTRS:
+    for name, scim in ATTR_MAP:
         raw = (row.get(name) or "").strip()
         vals = [v.strip() for v in raw.split("|") if v.strip()]
         # THE PAD IS LOAD-BEARING. See the script header: without a second
         # element Verify emits a scalar and Praxis's claim mapper silently
         # drops the claim, which surfaces as a policy deny.
-        attrs[name] = vals + [""]
+        attrs[scim] = vals + [""]
     user["attributes"] = attrs
     out.append(user)
 
@@ -260,9 +312,12 @@ scim_payload() {
         password: $u.password,
         "urn:ietf:params:scim:schemas:extension:ibm:2.0:User": {
           userCategory: "regular",
-          # Pre-verified: nothing in the demo exercises an email round-trip and
-          # @corp.com does not resolve.
-          emailVerified: true,
+          # NO emailVerified HERE. This tenant rejects it outright:
+          #   CSIAI0111E The supplied JSON contained an invalid attribute: emailVerified
+          # It is also unnecessary — nothing in the demo exercises an email
+          # round-trip, and the Notification block below (notifyType: NONE) is
+          # what actually stops Verify mailing the clear-text password to
+          # @corp.com, which does not resolve.
           twoFactorAuthentication: false,
           customAttributes: ($u.attributes | to_entries
                               | map({ name: .key, values: .value }))
@@ -275,29 +330,12 @@ scim_payload() {
       }'
 }
 
-# ==========================================================================
-# 1. Custom attribute definitions
-# ==========================================================================
-# A custom attribute must exist in the TENANT SCHEMA before a user payload may
-# carry it — an undefined attribute fails the create with a validation error
-# rather than being created implicitly. Each definition claims one of the
-# predefined customAttribute1..150 slots.
-#
-# datatype string[] is what keeps these multi-valued. The slot numbers are
-# arbitrary but must be stable: changing one after users exist orphans the
-# stored values.
-#
-# Format: scimName:slot
-ATTRS=(
-  "roles:customAttribute1"
-  "permissions:customAttribute2"
-  "teams:customAttribute3"
-  "gh_permissions:customAttribute4"
-)
 
 attr_payload() {
-  local name="$1" slot="$2"
-  jq -nc --arg name "$name" --arg slot "$slot" '{
+  local name="$1" slot="$2" scim="$3"
+  # attributeName is validated with the same letters-only rule as scimName, so
+  # both take $scim. Only the human-facing name/description keep the underscore.
+  jq -nc --arg name "$name" --arg slot "$slot" --arg scim "$scim" '{
     name: $name,
     description: ("Policy-engine demo claim: " + $name),
     datatype: "string[]",
@@ -305,8 +343,8 @@ attr_payload() {
     sourceType: "schema",
     schemaAttribute: {
       name: $slot,
-      attributeName: $name,
-      scimName: $name,
+      attributeName: $scim,
+      scimName: $scim,
       customAttribute: true
     }
   }'
@@ -315,20 +353,21 @@ attr_payload() {
 create_attrs() {
   echo
   echo "$(dim 'Custom attribute definitions') $(dim "-> ${TENANT_URL}/v1.0/attributes")"
-  local entry name slot body
+  local entry name slot scim body rest
   for entry in "${ATTRS[@]}"; do
-    name="${entry%%:*}"; slot="${entry##*:}"
-    body="$(attr_payload "$name" "$slot")"
+    name="${entry%%:*}"; rest="${entry#*:}"
+    slot="${rest%%:*}"; scim="${rest##*:}"
+    body="$(attr_payload "$name" "$slot" "$scim")"
 
     if [ "$DRY_RUN" = true ]; then
-      ok "$name" "$(dim "$slot (dry-run)")"
+      ok "$name" "$(dim "$slot, scimName=$scim (dry-run)")"
       printf '%s\n' "$body" | jq . | sed 's/^/      /'
       continue
     fi
 
     _split_resp "$(api POST "/v1.0/attributes" "$body")"
     case "$RESP_STATUS" in
-      201|200) ok   "$name" "$(dim "defined as $slot")" ;;
+      201|200) ok   "$name" "$(dim "defined as $slot (scimName=$scim)")" ;;
       # Verify returns 400 for an already-defined name as well as for genuine
       # validation errors, so the message is the only way to tell them apart.
       # Treat "exists"/"duplicate" as idempotent success and surface the rest.
@@ -339,11 +378,23 @@ create_attrs() {
           fail "$name" "HTTP $RESP_STATUS"
           printf '%s\n' "$RESP_BODY" | jq . 2>/dev/null | sed 's/^/      /' \
             || printf '      %s\n' "$RESP_BODY"
+          # CSIAI0096E on [scimName]/[attributeName] is the letters-only rule,
+          # not a transient failure: no retry will help, the ATTRS entry needs a
+          # letters-only scimName in its third field.
+          if printf '%s' "$RESP_BODY" | grep -qE 'CSIAI0096E|not valid for attribute'; then
+            echo "$(dim "      scimName '$scim' was rejected. Verify allows LETTERS ONLY here —")"
+            echo "$(dim "      no '_' or '-'. Set a letters-only scimName in the third field of")"
+            echo "$(dim "      this attribute's ATTRS entry (e.g. gh_permissions -> ghpermissions).")"
+          fi
           die "attribute '$name' could not be defined; users would fail validation"
         fi
         ;;
       403) fail "$name" "HTTP 403 — the API client lacks the 'manageAttributes' entitlement"
            die "insufficient entitlements" ;;
+      # /v1.0/attributes is plain JSON, not SCIM. A 406 means something sent it
+      # scim+json — see the media-type switch in api().
+      406) fail "$name" "HTTP 406 — /v1.0/attributes was sent a non-JSON Accept type"
+           die "wrong media type for the Attributes API" ;;
       *)   fail "$name" "HTTP $RESP_STATUS"
            printf '%s\n' "$RESP_BODY" | jq . 2>/dev/null | sed 's/^/      /' \
              || printf '      %s\n' "$RESP_BODY"
