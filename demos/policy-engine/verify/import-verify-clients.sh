@@ -60,6 +60,17 @@
 #
 # 3. Grant types are the STRINGS "true"/"false", not JSON booleans.
 #
+# 3a. Enabling grantTypes.tokenExchange REQUIRES subjectTokenTypes, or the
+#    create fails with:
+#      CSIAQ0377 At least one subject token type is required.
+#    It lives at providers.oidc.properties.additionalConfig.subjectTokenTypes
+#    (the same additionalConfig that carries useUserDefaultEntitlements), NOT
+#    under providers.oidc.token where the other token settings are. Unlike
+#    idTokenSigningAlg it DOES read back on GET, so --discover can show it.
+#    The tenant supplies no default: an app with tokenExchange off reads back
+#    with the field absent entirely. Set alongside it is requestedTokenTypes,
+#    the mirror field for what the exchange may mint.
+#
 # 4. Claim mappers are CELx functions, not sourceId references. The API
 #    reference describes providers.oidc.token.attributeMappings[] as
 #    JWTAttributeMapBean requiring `sourceId` + `targetName`, which implies
@@ -145,9 +156,19 @@
 # any user can mint from undercuts eve-vs-bob. Use --all-users on a throwaway
 # tenant where that does not matter.
 #
-# Only clients users authenticate TO need this (role=mint). The exchange client
-# acts on a subject_token and the audience placeholders are never authenticated
-# to, so neither is entitled — and neither needs to be.
+# BOTH role=mint AND role=exchange need this. The exchange was long assumed not
+# to, on the reasoning that nobody ever authenticates to it — but an RFC 8693
+# exchange carries the SUBJECT's identity, and Verify checks that user's
+# entitlement against the exchange application too. Without it the mint leg
+# succeeds and the exchange leg fails with CSIAQ0279E, which reads like a
+# token-exchange feature problem rather than an entitlement one.
+#
+# Verified: the reference tenant's working praxis-sts-1 carries
+# birthRightAccess=true; a freshly created one with no entitlement is denied,
+# and granting the four personas makes the exchange succeed immediately.
+#
+# role=audience genuinely needs none: those are audience strings, and nothing
+# ever presents a user to them.
 
 set -euo pipefail
 
@@ -471,7 +492,7 @@ app_payload() {
               # create fails with CSIAQ0257. See the script header.
               idTokenSigningAlg: $alg,
               doNotGenerateClientSecret: false,
-              additionalConfig: {
+              additionalConfig: ({
                 # Without this, ROPC on a freshly created client fails with
                 #   CSIAQ0279E Only entitled users can single sign-on to the
                 #              application. You must request for application access.
@@ -481,12 +502,30 @@ app_payload() {
                 # this client", which is what the demo minting client needs and
                 # what the tenant version already carries.
                 #
-                # Only the minting client needs it: no user ever authenticates
-                # to the exchange client (it acts on a subject_token) or to the
-                # audience placeholders, so they leave it false and stay
-                # correspondingly narrow.
+                # Scoped to the minting client: this flag is about the
+                # interactive sign-on default, and only role=mint is signed in
+                # to directly. The exchange client needs application
+                # ENTITLEMENT (granted separately, below) but not this default
+                # — the audience placeholders need neither.
                 useUserDefaultEntitlements: ($c.role == "mint")
+                # Enabling the tokenExchange grant makes these REQUIRED; without
+                # subjectTokenTypes the create fails with:
+                #   CSIAQ0377 At least one subject token type is required.
+                # It is the token type the exchange ACCEPTS as its subject_token,
+                # and it has no default — github-api, whose tokenExchange is off,
+                # reads back with the field absent, so the tenant does not fill
+                # it in. Hence set it only when the grant is on.
+                #
+                # requestedTokenTypes is the mirror field (what the exchange may
+                # MINT). The working praxis-sts-1 on the reference tenant carries
+                # both, each holding just access_token — exactly what
+                # verify-ibm-verify-token-exchange.sh sends as
+                # subject_token_type and expects to get back.
               }
+              + (if $c.token_exchange then {
+                  subjectTokenTypes:   ["urn:ietf:params:oauth:token-type:access_token"],
+                  requestedTokenTypes: ["urn:ietf:params:oauth:token-type:access_token"]
+                } else {} end))
             },
             token: {
               # accessTokenType, NOT accessTokenFormat. Praxis validates the
@@ -661,7 +700,13 @@ create_clients() {
         # A client users authenticate TO is gated on application entitlement,
         # which is a separate resource from the application itself. Grant it now
         # or the client cannot mint (CSIAQ0279E). See the script header.
-        if [ "$role" = "mint" ]; then
+        # Both mint AND exchange need entitlement. The exchange was long assumed
+        # not to ("nobody authenticates to it"), but an RFC 8693 exchange carries
+        # the SUBJECT's identity, so Verify checks that user against the exchange
+        # application as well — without it the exchange leg fails CSIAQ0279E even
+        # though the mint leg works. Verified on a live tenant. role=audience
+        # genuinely needs none: nothing ever presents a user to it.
+        if [ "$role" = "mint" ] || [ "$role" = "exchange" ]; then
           if [ "$DO_ENTITLE" = true ]; then
             if ! entitle_app "$id" "$name"; then
               NEEDS_ENTITLEMENT+=("$name")
@@ -678,6 +723,9 @@ create_clients() {
         # The two 400s that actually happen, and what they mean.
         case "$RESP_BODY" in
           *CSIAQ0257*) echo "$(dim '      A JWT access token needs idTokenSigningAlg — see the script header.')" ;;
+          *CSIAQ0377*) echo "$(dim '      token_exchange=true needs additionalConfig.subjectTokenTypes — see')"
+                       echo "$(dim '      note 3a in the script header. A tenant that rejects the value this')"
+                       echo "$(dim '      script sends would show its own in --discover.')" ;;
           *) echo "$(dim "      Often a templateId the tenant does not know. Run --discover to see")"
              echo "$(dim "      which templateId its own applications use.")" ;;
         esac

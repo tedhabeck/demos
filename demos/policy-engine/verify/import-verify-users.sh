@@ -59,6 +59,44 @@
 # gh_permissions is padded too, for consistency, though it does not strictly
 # need it: it is a passthrough claim (subject.claims) rather than one of the
 # mapper's structured array fields, so it never reaches as_array.
+#
+# ---------------------------------------------------------------------------
+# pwdReset: a REQUEST HEADER, not a payload field
+# ---------------------------------------------------------------------------
+# Verify sets pwdReset=true on every user created through the SCIM API — the
+# "user must change password at next sign-in" flag. It is how Verify treats any
+# admin-set password. The user is otherwise perfect, but ROPC refuses it:
+#
+#   CSIAQ0267E The password must be changed.
+#
+# which names neither the user nor the cause, so it reads like a bad password in
+# users.csv or a broken client.
+#
+# The fix is a request header on POST /v2.0/Users:
+#
+#   usershouldnotneedtoresetpassword: true
+#
+# Verified: with it the create returns pwdReset=null and the password grant
+# works immediately; without it, pwdReset=true and every mint fails.
+#
+# It is worth being explicit about WHY this is a header, because the natural
+# assumption is that it must be a payload field somewhere. It is not, and the
+# payload cannot express it — all of these were tried against a live tenant:
+#
+#   - pwdReset:false in the create body   -> 201, silently ignored
+#   - PATCH pwdReset                      -> 400 CSIAI0174E (read-only; a PATCH
+#                                            of `active` returns 204, so the
+#                                            request shape was not the problem)
+#   - PATCH password to a NEW value       -> 204, pwdReset STAYS true — an admin
+#                                            write is itself a reset
+#   - userCategory:"federated"            -> 400, and changes what the user is
+#
+# So there is no way to discover this from the payload or from reading a working
+# user back: an already-fixed user and a header-created one look identical.
+#
+# create_users() also still reports any user that comes back with pwdReset=true,
+# which now means the header was rejected or ignored (a tenant that does not
+# honour it) rather than the normal state of affairs.
 
 set -euo pipefail
 
@@ -173,8 +211,11 @@ get_token() {
 #
 # The Attributes API rejects scim+json in Accept with "406 Not Acceptable"
 # before it ever looks at the body, so send each endpoint the type it declares.
+# api <METHOD> <PATH> [BODY] [EXTRA_HEADER]
+# EXTRA_HEADER is passed through as one -H. Only create_users() uses it, for the
+# pwdReset header documented in the header of this script.
 api() {
-  local method="$1" path="$2" body="${3:-}"
+  local method="$1" path="$2" body="${3:-}" extra_header="${4:-}"
   local ctype="application/json"
   case "$path" in
     /v2.0/*) ctype="application/scim+json; charset=utf-8" ;;
@@ -184,6 +225,9 @@ api() {
     -H "Accept: $ctype")
   if [ -n "$body" ]; then
     args+=(-H "Content-Type: $ctype" -d "$body")
+  fi
+  if [ -n "$extra_header" ]; then
+    args+=(-H "$extra_header")
   fi
   curl "${args[@]}"
 }
@@ -416,6 +460,11 @@ find_user_id() {
   printf '%s' "$RESP_BODY" | jq -r '.Resources[0].id // empty'
 }
 
+# Users the tenant flagged "must change password at next sign-in". They are
+# created correctly but CANNOT use the password grant until the flag is cleared,
+# and nothing in the SCIM API can clear it. See the note in the header.
+declare -a NEEDS_PWD_RESET=()
+
 create_users() {
   echo
   echo "$(dim 'Users') $(dim "-> ${TENANT_URL}/v2.0/Users")"
@@ -431,10 +480,22 @@ create_users() {
       continue
     fi
 
-    _split_resp "$(api POST "/v2.0/Users" "$body")"
+    # The header is what keeps the new user out of "must change password at next
+    # sign-in" — see the pwdReset note in the script header. Nothing in the
+    # PAYLOAD can do this.
+    _split_resp "$(api POST "/v2.0/Users" "$body" \
+                       "usershouldnotneedtoresetpassword: true")"
     case "$RESP_STATUS" in
       201)
-        ok "$username" "$(dim "id=$(printf '%s' "$RESP_BODY" | jq -r '.id // "?"')")" ;;
+        ok "$username" "$(dim "id=$(printf '%s' "$RESP_BODY" | jq -r '.id // "?"')")"
+        # The create response already carries pwdReset, so this costs no extra
+        # call. true means the tenant requires a password change before the
+        # password grant will work — the user exists but cannot mint yet.
+        if printf '%s' "$RESP_BODY" | jq -e '
+             ."urn:ietf:params:scim:schemas:extension:ibm:2.0:User".pwdReset == true' \
+             >/dev/null 2>&1; then
+          NEEDS_PWD_RESET+=("$username")
+        fi ;;
       409)
         # Already present. Overwriting a user's attributes is a bigger action
         # than "import" implies, so report it and let the operator choose
@@ -512,6 +573,27 @@ echo
 if [ "$DRY_RUN" = true ]; then
   echo "$(dim 'Dry run only — nothing was sent to the tenant.')"
 else
+  # Surfaced BEFORE the "verify it end to end" hint, because on a tenant with
+  # this policy those commands cannot succeed yet and the reason is not
+  # discoverable from their error (CSIAQ0267E names no user and no cause).
+  if [ "${#NEEDS_PWD_RESET[@]}" -gt 0 ]; then
+    echo "$(yellow 'MUST CHANGE PASSWORD') $(dim '— these users cannot use the password grant yet:')"
+    for u in "${NEEDS_PWD_RESET[@]}"; do echo "  $(dim "• $u")"; done
+    echo
+    echo "$(dim '  These came back pwdReset=true ("must change password at next sign-in"),')"
+    echo "$(dim '  so the password grant will refuse them:')"
+    echo "$(dim '    CSIAQ0267E The password must be changed.')"
+    echo
+    echo "$(dim '  This script sends the header that prevents it:')"
+    echo "$(dim '    usershouldnotneedtoresetpassword: true')"
+    echo "$(dim '  so seeing this means the tenant did not honour it. Nothing in the SCIM')"
+    echo "$(dim '  PAYLOAD can substitute — see the pwdReset note in the script header.')"
+    echo
+    echo "$(dim '  Clear it per user in the console (Directory -> Users and groups -> <user>')"
+    echo "$(dim '  -> remove the password-change requirement), and please note the tenant')"
+    echo "$(dim '  version: the header working is what makes this script unattended.')"
+    echo
+  fi
   echo "$(green 'Done.') Verify the result end to end with:"
   echo "  $(dim './mint-verify-token.sh alice | cut -d. -f2 | base64 -d 2>/dev/null | jq .')"
   echo "  $(dim './verify-ibm-verify-token-exchange.sh')"
