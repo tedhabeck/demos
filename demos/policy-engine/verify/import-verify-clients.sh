@@ -524,6 +524,7 @@ app_payload() {
               }
               + (if $c.token_exchange then {
                   subjectTokenTypes:   ["urn:ietf:params:oauth:token-type:access_token"],
+                  actorTokenTypes:   ["urn:ietf:params:oauth:token-type:access_token"],
                   requestedTokenTypes: ["urn:ietf:params:oauth:token-type:access_token"]
                 } else {} end))
             },

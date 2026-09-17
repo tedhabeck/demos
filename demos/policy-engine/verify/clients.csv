@@ -56,7 +56,7 @@
 ## If you want the console to show only what actually participates in the
 ## Verify path, delete these two rows; the demo behaves identically.
 name,role,ropc,client_creds,token_exchange,audiences,claims,pdv_id_key,pdv_secret_key
-praxis-identity-1,mint,true,true,false,praxis-gateway|workday-api|github-api,roles|permissions|teams|gh_permissions,HR_COPILOT_CLIENT_ID,HR_COPILOT_CLIENT_SECRET
-praxis-sts-1,exchange,false,true,true,workday-api|github-api,roles|permissions|teams|gh_permissions,GATEWAY_CLIENT_ID,GATEWAY_CLIENT_SECRET
+hr-copilot,mint,true,true,false,praxis-gateway|workday-api|github-api,roles|permissions|teams|gh_permissions,HR_COPILOT_CLIENT_ID,HR_COPILOT_CLIENT_SECRET
+praxis-gateway,exchange,false,true,true,workday-api|github-api,roles|permissions|teams|gh_permissions,GATEWAY_CLIENT_ID,GATEWAY_CLIENT_SECRET
 workday-api,audience,false,true,false,,,,
 github-api,audience,false,true,false,,,,
