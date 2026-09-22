@@ -60,6 +60,48 @@
 # need it: it is a passthrough claim (subject.claims) rather than one of the
 # mapper's structured array fields, so it never reaches as_array.
 #
+# `manager` is NOT one of these attributes and is not padded — it is not a custom
+# attribute at all. See the next section.
+#
+# ---------------------------------------------------------------------------
+# `manager` is a SCIM relationship, not a custom attribute
+# ---------------------------------------------------------------------------
+# The other four claims are custom attributes in customAttribute1..150 slots.
+# `manager` is different in kind: it is the standard SCIM EnterpriseUser
+# extension's manager reference,
+#
+#   "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User": {
+#     "manager": { "value": "<SCIM id>", "$ref": "<.../Users/<id>>" }
+#   }
+#
+# and its value is the manager's SCIM **id**, not their userName. The tenant
+# generates $ref itself; only `value` is written.
+#
+# This matters because of what the token mapper does with it. The introspection
+# mapper on the client is:
+#
+#   statements:
+#     - context: manager := user.getManager()
+#     - return: context.manager.userName
+#
+# getManager() FOLLOWS the reference above and returns the manager's user object,
+# and the mapper reads .userName off it. So the claim is a scalar string
+# ("alice") produced by a relationship traversal — there is no custom attribute
+# holding it, and creating one would be dead weight the mapper never reads.
+# (The tenant's own `manager_uid` attribute is sourced from
+# ...enterprise:2.0:User:manager.value, i.e. from this same relationship.)
+#
+# TWO CONSEQUENCES for this script:
+#
+#   1. It cannot be set in the CREATE payload, because the manager's id does not
+#      exist until that user is created. bob names alice, and if alice is created
+#      after bob there is nothing to reference. So managers are a SECOND PASS
+#      (link_managers) after every user exists, resolving userName -> id.
+#
+#   2. It is a PATCH, not a field: op=replace on
+#      <enterprise schema>:manager. Verified on a live tenant — 204, and the
+#      read-back carries the generated $ref. op=remove clears it.
+#
 # ---------------------------------------------------------------------------
 # pwdReset: a REQUEST HEADER, not a payload field
 # ---------------------------------------------------------------------------
@@ -260,6 +302,11 @@ _split_resp() {
 # from the tenant rather than assuming name == scimName. Keep this in sync with
 # that script and with verify/README.md.
 #
+# `manager` is deliberately NOT in this list: it is a SCIM relationship, not a
+# custom attribute, and the client's mapper reaches it with getManager() rather
+# than getCustomValues(). Adding it here would claim a slot nothing reads. See
+# the "manager is a SCIM relationship" section in the header and link_managers().
+#
 # Format: displayName:slot:scimName
 ATTRS=(
   "roles:customAttribute1:roles"
@@ -267,6 +314,10 @@ ATTRS=(
   "teams:customAttribute3:teams"
   "gh_permissions:customAttribute4:ghpermissions"
 )
+
+# The SCIM extension that carries the manager reference. Long enough, and used in
+# enough places below, to be worth a name.
+ENTERPRISE_SCHEMA="urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"
 
 # --- CSV -> JSON ----------------------------------------------------------
 # Parsed with python3's csv module rather than IFS=, read: it handles quoting
@@ -286,6 +337,13 @@ csv_json() {
 import csv, json, sys
 
 REQUIRED = ["username", "email", "first_name", "last_name", "password"]
+
+# `manager` is optional and single-valued: it names ONE userName, resolved to a
+# SCIM id in a second pass (see link_managers in the shell below). It is not a
+# custom attribute, so it is carried as a plain field rather than through
+# ATTR_MAP, and it is never padded — the client mapper returns
+# getManager().userName, a scalar string.
+OPTIONAL = ["manager"]
 
 # Custom attributes, in the order they are emitted. The CSV column keeps the
 # readable name (gh_permissions); the SCIM payload must use the tenant's
@@ -308,7 +366,7 @@ if missing:
 out = []
 seen = set()
 for i, row in enumerate(reader, start=2):
-    user = {k: (row.get(k) or "").strip() for k in REQUIRED}
+    user = {k: (row.get(k) or "").strip() for k in REQUIRED + OPTIONAL}
     if not user["username"]:
         sys.exit(f"row {i}: empty username")
     if user["username"] in seen:
@@ -329,7 +387,29 @@ for i, row in enumerate(reader, start=2):
         # drops the claim, which surfaces as a policy deny.
         attrs[scim] = vals + [""]
     user["attributes"] = attrs
+
+    # The manager cell names one userName. A pipe here is an operator assuming it
+    # behaves like the multi-valued columns next to it; the reference can hold
+    # exactly one id, so say so rather than silently taking the first.
+    if "|" in user["manager"]:
+        sys.exit(f"row {i}: {user['username']} has multiple managers "
+                 f"({user['manager']!r}); the SCIM manager reference holds one "
+                 f"user, and the claim becomes a single CIBA login_hint")
+    if user["manager"] and user["manager"] == user["username"]:
+        sys.exit(f"row {i}: {user['username']} is their own manager; "
+                 f"require_approval would ask them to approve themselves")
     out.append(user)
+
+# Managers are resolved by userName against the tenant, but a name that is simply
+# misspelled here would resolve to nothing and be reported as a missing tenant
+# user — misleading when the intended manager is right there in the CSV. Catch
+# the in-file case now, where the row number is still available.
+for u in out:
+    if u["manager"] and u["manager"] not in seen:
+        sys.exit(f"{u['username']}'s manager {u['manager']!r} is not a username "
+                 f"in this file. A manager outside the CSV is legitimate — it "
+                 f"just has to already exist on the tenant, so remove this check "
+                 f"if that is what you mean.")
 
 json.dump(out, sys.stdout)
 PY
@@ -521,6 +601,90 @@ create_users() {
   done
 }
 
+# ==========================================================================
+# 3. Manager links
+# ==========================================================================
+# A SECOND PASS, run after every user exists, because the manager reference holds
+# the manager's SCIM **id** and that id does not exist until they are created.
+# bob names alice; whether alice happens to be created first is an accident of
+# CSV row order, so this does not depend on it.
+#
+# Written with PATCH op=replace rather than in the create payload: replace is
+# idempotent (it sets the same id on a re-run) and it works on users that already
+# existed, which is the common case when re-running against a live tenant where
+# create returns 409 and changes nothing.
+#
+# The claim this feeds is produced on the CLIENT by the introspection mapper
+#   statements:
+#     - context: manager := user.getManager()
+#     - return: context.manager.userName
+# so what lands here is the relationship; the userName in the token is derived
+# from it by that mapper. A user with no manager gets no link and no claim.
+declare -a MANAGER_UNLINKED=()
+
+link_managers() {
+  # Nothing to do if no row names a manager — do not print an empty section.
+  local pairs
+  pairs=$(printf '%s' "$USERS_JSON" | jq -r '.[] | select(.manager != "")
+    | "\(.username)\t\(.manager)"')
+  [ -n "$pairs" ] || return 0
+
+  echo
+  echo "$(dim 'Manager links') $(dim "-> PATCH ${TENANT_URL}/v2.0/Users/<id>")"
+
+  local username mgr uid mgr_id body
+  while IFS=$'\t' read -r username mgr; do
+    [ -n "$username" ] || continue
+
+    if [ "$DRY_RUN" = true ]; then
+      ok "$username" "$(dim "would set manager -> $mgr (dry-run; ids resolved on a real run)")"
+      continue
+    fi
+
+    # Both sides resolve by userName. The manager need not be in the CSV, but it
+    # must exist on the tenant — the CSV-internal case is already checked at parse
+    # time, so a failure here means the tenant is missing them.
+    if ! uid=$(find_user_id "$username") || [ -z "$uid" ]; then
+      warn "$username" "$(dim 'not on the tenant — no manager link')"
+      MANAGER_UNLINKED+=("$username -> $mgr")
+      continue
+    fi
+    if ! mgr_id=$(find_user_id "$mgr") || [ -z "$mgr_id" ]; then
+      fail "$username" "$(dim "manager '$mgr' not found on the tenant")"
+      MANAGER_UNLINKED+=("$username -> $mgr")
+      continue
+    fi
+
+    # $ref is generated by the tenant; only `value` is writable.
+    body=$(jq -nc --arg s "$ENTERPRISE_SCHEMA" --arg id "$mgr_id" '{
+      schemas: ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+      Operations: [ { op: "replace", path: ($s + ":manager"),
+                      value: { value: $id } } ]
+    }')
+
+    _split_resp "$(api PATCH "/v2.0/Users/$uid" "$body")"
+    case "$RESP_STATUS" in
+      200|204) ok "$username" "$(dim "manager -> $mgr ($mgr_id)")" ;;
+      400)
+        fail "$username" "HTTP 400 — the manager reference was rejected"
+        printf '%s\n' "$RESP_BODY" | jq . 2>/dev/null | sed 's/^/      /' \
+          || printf '      %s\n' "$RESP_BODY"
+        echo "$(dim "      Expected path: ${ENTERPRISE_SCHEMA}:manager")"
+        echo "$(dim '      A tenant without the enterprise SCIM extension enabled would')"
+        echo "$(dim '      reject this; the manager claim then has no source.')"
+        MANAGER_UNLINKED+=("$username -> $mgr") ;;
+      403)
+        fail "$username" "HTTP 403 — the API client lacks the 'manageUsers' entitlement"
+        MANAGER_UNLINKED+=("$username -> $mgr") ;;
+      *)
+        fail "$username" "HTTP $RESP_STATUS"
+        printf '%s\n' "$RESP_BODY" | jq . 2>/dev/null | sed 's/^/      /' \
+          || printf '      %s\n' "$RESP_BODY"
+        MANAGER_UNLINKED+=("$username -> $mgr") ;;
+    esac
+  done <<< "$pairs"
+}
+
 delete_users() {
   echo
   echo "$(yellow 'Deleting') $(dim "the ${USER_COUNT} users in $(basename "$CSV") from ${TENANT_URL}")"
@@ -566,7 +730,12 @@ if [ "$DO_DELETE" = true ]; then
   delete_users
 else
   [ "$DO_ATTRS" = true ] && create_attrs
-  [ "$DO_USERS" = true ] && create_users
+  if [ "$DO_USERS" = true ]; then
+    create_users
+    # Second pass: needs every user to exist, including ones create_users
+    # skipped as already-present (409).
+    link_managers
+  fi
 fi
 
 echo
@@ -594,6 +763,15 @@ else
     echo "$(dim '  version: the header working is what makes this script unattended.')"
     echo
   fi
+  if [ "${#MANAGER_UNLINKED[@]}" -gt 0 ]; then
+    echo "$(yellow 'NO MANAGER LINK') $(dim '— these users carry no manager claim:')"
+    for u in "${MANAGER_UNLINKED[@]}"; do echo "  $(dim "• $u")"; done
+    echo
+    echo "$(dim '  The client mapper returns getManager().userName, so without the link the')"
+    echo "$(dim '  claim is absent and require_approval(from: claim.manager) has nothing to')"
+    echo "$(dim '  resolve — scenario 11 cannot route its CIBA approval.')"
+    echo
+  fi
   echo "$(green 'Done.') Verify the result end to end with:"
   echo "  $(dim './mint-verify-token.sh alice | cut -d. -f2 | base64 -d 2>/dev/null | jq .')"
   echo "  $(dim './verify-ibm-verify-token-exchange.sh')"
@@ -602,4 +780,11 @@ else
   echo "$(dim 'as claims. That mapping is client config, not user data, and this script')"
   echo "$(dim 'does not touch it — check roles/permissions/teams/gh_permissions appear in')"
   echo "$(dim 'the decoded token above before running the walkthrough.')"
+  echo
+  echo "$(dim 'The manager claim is bob'"'"'s, not alice'"'"'s, and comes from the relationship')"
+  echo "$(dim 'set above rather than a custom attribute — check it separately:')"
+  echo "  $(dim './mint-verify-token.sh bob | cut -d. -f2 | base64 -d 2>/dev/null | jq .manager')"
+  echo "$(dim 'Expect the STRING "alice". A missing claim means the client has no manager')"
+  echo "$(dim 'mapper (getManager().userName); [] or [""] means it was mapped like one of')"
+  echo "$(dim 'the padded set claims, which the CIBA login_hint cannot use.')"
 fi

@@ -102,6 +102,13 @@
 # Remove the pad from PAD_CEL only once the upstream scalar->single-element-vec
 # fallback lands, and then from the mappers on the tenant too.
 #
+# ONE CLAIM IS EXEMPT: `manager`. It is not a custom attribute at all — it is the
+# SCIM EnterpriseUser manager relationship, mapped with getManager().userName,
+# which yields a scalar string. Its consumer is
+# require_approval(from: claim.manager) in policy-verify-opa.yaml, which passes
+# the value to CIBA as the login_hint naming the human approver, so padding it
+# would break exactly what the pad exists to protect. See MANAGER_CEL below.
+#
 # ---------------------------------------------------------------------------
 # getCustomValues() takes the scimName, which is not always the display name
 # ---------------------------------------------------------------------------
@@ -386,6 +393,58 @@ PAD_CEL='statements:
   - context: "paddedValues := context.safeValues + ['\'''\'']"
   - return: context.paddedValues'
 
+# ---------------------------------------------------------------------------
+# `manager` is mapped from a RELATIONSHIP, not from a custom attribute
+# ---------------------------------------------------------------------------
+# Every claim above reads a custom attribute through getCustomValues(). `manager`
+# does not, and cannot: on this tenant it is the standard SCIM EnterpriseUser
+# manager reference, whose stored value is the manager's SCIM **id**. The mapper
+# therefore traverses the reference and reads the userName off the user it
+# resolves to:
+#
+#   statements:
+#     - context: manager := user.getManager()
+#     - return: context.manager.userName
+#
+# Three things follow, all of which make it unlike the mappers above:
+#
+#   - It takes NO scimName. The %s-style substitution the others use does not
+#     apply, so this is a literal, not a printf template.
+#   - It returns a SCALAR string ("alice"), which is what
+#     require_approval(from: claim.manager) in policy-verify-opa.yaml needs — it
+#     hands the value to CIBA as the login_hint naming the human approver. A
+#     padded ["alice", ""] would be unusable there.
+#   - There is nothing to resolve or validate against /v1.0/attributes, so
+#     resolve_scim_names() skips it. A missing manager RELATIONSHIP is a user-data
+#     problem that import-verify-users.sh reports, not a mapper problem.
+#
+# Verified on the live tenant: bob's record carries
+#   enterprise:2.0:User.manager = { value: "<alice's id>", $ref: ... }
+# and the tenant's own manager_uid attribute is sourced from that same
+# manager.value — confirming the relationship is the source of truth.
+MANAGER_CEL='statements:
+  - context: manager := user.getManager()
+  - return: context.manager.userName'
+
+# Claims mapped from something other than a custom attribute, with the CELx each
+# one uses. Keep in sync with import-verify-users.sh, which sets the relationship
+# these read: that script decides what is STORED, this one what reaches the
+# TOKEN, and a disagreement means the data is right and the claim is wrong.
+RELATIONSHIP_CLAIMS=" manager "
+
+is_relationship_claim() {
+  case "$RELATIONSHIP_CLAIMS" in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+
+# The CELx for a relationship claim. Separate function so adding a second one
+# (a user's department, say) does not mean touching app_payload().
+relationship_cel() {
+  case "$1" in
+    manager) printf '%s' "$MANAGER_CEL" ;;
+    *) die "no CELx defined for relationship claim '$1'" ;;
+  esac
+}
+
 # Resolved at run time into "claim=scimName" pairs by resolve_scim_names().
 declare -a SCIM_MAP=()
 
@@ -408,7 +467,12 @@ scim_name_for() {
 # and then silently yield nothing, which surfaces as a policy deny.
 resolve_scim_names() {
   local claims attrs_json
-  claims=$(printf '%s' "$CLIENTS_JSON" | jq -r '[.[].claims[]] | unique | .[]')
+  # Relationship claims (manager) are excluded: they are not custom attributes,
+  # so /v1.0/attributes has no entry for them and the not-found branch below
+  # would kill an otherwise correct run.
+  claims=$(printf '%s' "$CLIENTS_JSON" | jq -r --arg rel "$RELATIONSHIP_CLAIMS" '
+    ($rel | split(" ") | map(select(. != ""))) as $skip
+    | [.[].claims[]] | unique | map(select(. as $c | $skip | index($c) | not)) | .[]')
   [ -n "$claims" ] || return 0
 
   _split_resp "$(api GET "/v1.0/attributes?limit=200")"
@@ -444,9 +508,16 @@ app_payload() {
 
   while IFS= read -r claim; do
     [ -n "$claim" ] || continue
-    scim="$(scim_name_for "$claim")"
-    # shellcheck disable=SC2059
-    cel="$(printf "$PAD_CEL" "$scim")"
+    # A relationship claim (manager) is mapped by traversal and takes no
+    # scimName; everything else reads a custom attribute through the padded
+    # array mapper. See RELATIONSHIP_CLAIMS.
+    if is_relationship_claim "$claim"; then
+      cel="$(relationship_cel "$claim")"
+    else
+      scim="$(scim_name_for "$claim")"
+      # shellcheck disable=SC2059
+      cel="$(printf "$PAD_CEL" "$scim")"
+    fi
     mappers=$(printf '%s' "$mappers" | jq --arg t "$claim" --arg c "$cel" \
       '. + [{targetName: $t, function: {custom: $c}}]')
   done <<< "$(printf '%s' "$CLIENTS_JSON" | jq -r ".[$i].claims[]?")"
@@ -482,7 +553,8 @@ app_payload() {
                 implicit: "false",
                 jwtBearer: "false",
                 deviceFlow: "false",
-                policyAuth: "false"
+                policyAuth: "false",
+                ciba: "true"
               },
               # Unused by the demo (no browser leg) but Verify wants the field
               # present; matches what the tenant'"'"'s working clients carry.
@@ -610,13 +682,23 @@ discover() {
   echo
   echo "$(dim 'Claim -> scimName') $(dim '(what the CELx mappers will call)')"
   local entry claim scim
-  [ "${#SCIM_MAP[@]}" -gt 0 ] || { warn "claims" "$(dim 'no claim mappers configured in the CSV')"; return 0; }
+  # Relationship claims resolve nothing, so they are absent from SCIM_MAP and
+  # listed separately rather than being silently omitted.
+  for claim in $RELATIONSHIP_CLAIMS; do
+    printf '%s' "$CLIENTS_JSON" | jq -e --arg c "$claim" \
+      '[.[].claims[]] | index($c) != null' >/dev/null 2>&1 \
+      && ok "$claim" "$(dim 'getManager().userName -> scalar string (relationship, not an attribute)')"
+  done
+  if [ "${#SCIM_MAP[@]}" -eq 0 ]; then
+    warn "claims" "$(dim 'no attribute-backed claim mappers configured in the CSV')"
+    return 0
+  fi
   for entry in "${SCIM_MAP[@]}"; do
     claim="${entry%%=*}"; scim="${entry#*=}"
     if [ "$claim" = "$scim" ]; then
-      ok "$claim" "$(dim "getCustomValues(\"$scim\")")"
+      ok "$claim" "$(dim "getCustomValues(\"$scim\") -> padded array")"
     else
-      warn "$claim" "$(dim "getCustomValues(\"$scim\") — scimName differs from the display name")"
+      warn "$claim" "$(dim "getCustomValues(\"$scim\") -> padded array — scimName differs from the display name")"
     fi
   done
 }
