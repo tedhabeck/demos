@@ -59,14 +59,18 @@
 #        silently. Say "exchanged token," not "audience-scoped token."
 #   V2 — layer 4 is an echo, not an entitlement check. See github-oauth below.
 #
-# Load-bearing tenant hack: Verify emits roles/teams/permissions as SCALARS at
-# N=1, and the standard claim mapper reads them via Value::as_array, which
-# returns None for a JSON string — yielding an empty subject.roles with no
-# error, which then presents as a policy deny rather than a config fault. The
-# tenant pads each claim with a trailing empty string so the value is always an
-# array. Remove the padding and every single-role persona breaks. The cost is
-# that "" becomes a real set member and will show up in audit records and
-# X-Policy-* debug output. See docs/brainstorms/ for the upstream fix.
+# Verify emits roles/teams/permissions as SCALARS at N=1, and the standard claim
+# mapper reads them via Value::as_array, which returns None for a JSON string —
+# yielding an empty subject.roles with no error, which then presents as a policy
+# deny rather than a config fault. This used to be worked around on the tenant, by
+# padding each claim with a trailing empty string so the value was always an
+# array, at the cost of "" becoming a real set member in audit records and
+# X-Policy-* debug output.
+#
+# `claim_mapper: ibmverify` below is the fix: the preset wraps a scalar into a
+# one-element vec, so the tenant's claims are unpadded now. The two settings go
+# together — an unpadded tenant read WITHOUT the preset silently empties
+# subject.roles for every single-valued persona.
 
 engine_settings:
   dispatch: policy
@@ -101,7 +105,7 @@ plugins:
             kind: jwks_url
             url: "${VERIFY_TENANT_URL}/oauth2/jwks"
           leeway_seconds: 60
-      claim_mapper: standard
+      claim_mapper: ibmverify
 
   # Client identity. Carries the agent's client_id / azp.
   - name: jwt-client
@@ -125,7 +129,7 @@ plugins:
             kind: jwks_url
             url: "${VERIFY_TENANT_URL}/oauth2/jwks"
           leeway_seconds: 60
-      claim_mapper: standard
+      claim_mapper: ibmverify
 
   # RFC 8693 token-exchange delegator. Trades the user's hr-copilot
   # token for a workday-api-audience-scoped access token.

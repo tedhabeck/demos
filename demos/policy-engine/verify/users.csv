@@ -33,8 +33,8 @@
 ##   - It holds ONE userName. A pipe-separated value is rejected.
 ##   - The importer sets it in a SECOND PASS, after all users exist — the id it
 ##     points at does not exist while the row is being created.
-##   - It is never padded with a trailing "". The client-side mapper is
-##     getManager().userName, which returns a scalar string.
+##   - It is single-valued. The client-side mapper is getManager().userName,
+##     which returns a scalar string.
 ##   - An empty cell means no manager and no `manager` claim in that user's token.
 ##
 ## The value must name a user the tenant has. The importer checks this file first,
@@ -43,18 +43,20 @@
 ##
 ## Two notes carried over from docs/brainstorms/2026-08-31-ibm-verify-idp-requirements.md:
 ##
-##   1. EMPTY-STRING PADDING IS LOAD-BEARING. Verify emits a custom attribute
-##      as a JSON scalar when it holds exactly one value, and Praxis's standard
-##      claim mapper reads roles/teams/permissions via Value::as_array — which
-##      returns None for a string, yielding an empty subject.roles with no
-##      error. That presents as a policy deny rather than a config fault. The
-##      importer appends a trailing "" to every multi-valued attribute so the
-##      claim is always array-shaped. Do not "clean up" that padding here or in
-##      the importer without first landing the upstream mapper fix.
+##   1. EMPTY-STRING PADDING IS NO LONGER NEEDED. Verify emits a custom
+##      attribute as a JSON scalar when it holds exactly one value, and Praxis's
+##      standard claim mapper read roles/teams/permissions via Value::as_array —
+##      which returns None for a string, yielding an empty subject.roles with no
+##      error, presenting as a policy deny rather than a config fault. Both
+##      importers used to append a trailing "" to force array shape. The
+##      `ibmverify` claim-mapper preset now wraps a scalar into a one-element vec
+##      on the engine side, so the values here are sent as they read.
 ##
-##      `manager` is not affected either way: it is not a custom attribute, and
-##      its claim is a scalar string produced by getManager().userName. Padding
-##      it would break the CIBA login_hint rather than protect it.
+##      The pad that reached tokens came from the CLIENT mappers, so re-run
+##      import-verify-clients.sh too — an older client still mints ["engineer", ""].
+##
+##      `manager` was never affected: it is not a custom attribute, and its claim
+##      is a scalar string produced by getManager().userName.
 ##
 ##   2. The realm export's `groups` attribute is intentionally absent below.
 ##      It duplicates `teams` for all four personas and no Verify-path policy

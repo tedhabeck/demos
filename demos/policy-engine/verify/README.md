@@ -105,27 +105,33 @@ by the gateway, so a live credential never lands in a rendered file on disk.
 
 ## Two things worth knowing before editing
 
-**The trailing `""` is load-bearing, and it comes from the CLIENT, not the user
-record.** Verify serialises a single-valued custom attribute as a JSON scalar.
-Praxis's standard claim mapper reads `roles`/`teams`/`permissions` via
-`Value::as_array`, which returns `None` for a string — so a one-role persona gets
-an empty `subject.roles`, silently, and `require(role.hr)` then fails as a
-*policy deny* rather than a config fault.
+**The trailing `""` pad is gone — the `ibmverify` claim-mapper preset replaced
+it.** Verify serialises a single-valued custom attribute as a JSON scalar, and
+Praxis's standard claim mapper read `roles`/`teams`/`permissions` via
+`Value::as_array`, which returns `None` for a string — so a one-role persona got
+an empty `subject.roles`, silently, and `require(role.hr)` then failed as a
+*policy deny* rather than a config fault. Both importers worked around it by
+appending a `""`, at the cost of `""` becoming a real set member in audit records
+and `X-Policy-*` output.
 
-Where the pad actually lives, confirmed against the live tenant:
+The preset wraps a scalar into a one-element vec on the engine side, so nothing
+has to force array shape any more. It is selected by `claim_mapper: ibmverify` on
+the `jwt-user` and `jwt-agent` plugins in `policy-verify-opa.yaml.tmpl`.
+
+Claims are now unpadded end to end:
 
 ```
-stored on the user   roles: ["engineer"]        <- unpadded
-minted in the token  roles: ["engineer", ""]    <- padded
+stored on the user   roles: ["engineer"]
+minted in the token  roles: ["engineer"]
 ```
 
-The padding is injected by each client's CELx claim mapper (`+ ['']` in
-`import-verify-clients.sh`), which is why recreating the clients without it
-breaks every single-valued persona. `import-verify-users.sh` also appends a pad
-to the values it sends; that is belt-and-braces and harmless, but the mapper is
-the part that matters. The known cost is that `""` becomes a real set member and
-shows up in audit records and `X-Policy-*` output. Remove it — from the mappers
-*and* the importer — only after the upstream scalar→single-element-vec fix lands.
+Two things to know when re-provisioning. The pad was injected by each client's
+CELx claim mapper, not by the user record — so a tenant whose clients were
+created by an older copy of `import-verify-clients.sh` keeps minting
+`["engineer", ""]` regardless of what `import-verify-users.sh` stores, because
+the mapper rebuilds the array from `getCustomValues()`. **Re-run both importers,
+not just the users one.** And a gateway *without* the preset needs the padding
+back; see git history for the mappers that append it.
 
 **Passwords come from the CSV, not from a rule.** They currently follow
 `<username>Lab3151`, matching `post_deploy_variables.json` so

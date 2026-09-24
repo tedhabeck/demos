@@ -5,7 +5,7 @@
 # docs/brainstorms/2026-08-31-ibm-verify-idp-requirements.md ("tenant setup is
 # documented, not automated") for the part that is most tedious and most
 # error-prone by hand: the four users, their four custom attributes, and the
-# array-shape padding those attributes require.
+# manager relationships between them.
 #
 # Usage:
 #   ./import-verify-users.sh                    # create attrs + users
@@ -41,27 +41,35 @@
 # post_deploy_variables.json, so there is nothing else to configure.
 #
 # ---------------------------------------------------------------------------
-# The empty-string padding is load-bearing — do not remove it
+# The empty-string padding is GONE — the engine handles scalars now
 # ---------------------------------------------------------------------------
-# Verify serialises a custom attribute holding exactly one value as a JSON
-# SCALAR, not a one-element array. Praxis's standard claim mapper reads
-# roles/teams/permissions via Value::as_array
-# (builtins/plugins/identity-jwt/src/claim_map.rs:222,248), which returns None
-# for a JSON string — so a single-role persona gets an EMPTY subject.roles with
-# no error raised, `require(role.hr)` fails, and the whole thing presents as a
-# policy deny rather than the config fault it actually is.
+# Verify still serialises a custom attribute holding exactly one value as a JSON
+# SCALAR, not a one-element array. This used to be load-bearing here: Praxis's
+# standard claim mapper read roles/teams/permissions via Value::as_array, which
+# returns None for a JSON string, so a single-role persona got an EMPTY
+# subject.roles with no error raised, `require(role.hr)` failed, and the whole
+# thing presented as a policy deny rather than the config fault it was. Every
+# multi-valued attribute was therefore padded with a trailing "" to force array
+# shape, at the known cost that "" became a real set member and showed up in
+# audit records and X-Policy-* debug output.
 #
-# Every multi-valued attribute below is therefore padded with a trailing ""
-# so the claim is always array-shaped. The cost, accepted knowingly: "" becomes
-# a real set member and will appear in audit records and X-Policy-* debug
-# output. Remove the padding only once the upstream scalar->vec fallback lands.
+# The `ibmverify` claim-mapper preset removes the reason for it: it wraps a JSON
+# scalar into a one-element vec before the structured fields are read, so an
+# unpadded single-valued attribute now maps correctly. The policy selects it with
+#   claim_mapper: ibmverify
+# on the jwt-user and jwt-agent plugins (policy-verify-opa.yaml.tmpl).
 #
-# gh_permissions is padded too, for consistency, though it does not strictly
-# need it: it is a passthrough claim (subject.claims) rather than one of the
-# mapper's structured array fields, so it never reaches as_array.
+# So the values sent below are unpadded, and the CELx mappers in
+# import-verify-clients.sh no longer append `+ ['']` either. Both sides have to
+# agree: a tenant whose clients still carry the old padded mappers will mint
+# ["engineer", ""] no matter what this script stores, because the mapper rebuilds
+# the array from getCustomValues(). Re-run import-verify-clients.sh after this.
 #
-# `manager` is NOT one of these attributes and is not padded — it is not a custom
-# attribute at all. See the next section.
+# If you are pointing this at a gateway WITHOUT the ibmverify preset, the padding
+# is load-bearing again — see git history for the version that appends it.
+#
+# `manager` is NOT one of these attributes and never was padded — it is not a
+# custom attribute at all. See the next section.
 #
 # ---------------------------------------------------------------------------
 # `manager` is a SCIM relationship, not a custom attribute
@@ -325,8 +333,8 @@ ENTERPRISE_SCHEMA="urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"
 # Columns are read BY HEADER NAME, so the CSV stays reorderable and an operator
 # can add a column without touching the field offsets here.
 #
-# Multi-valued cells are pipe-separated (see users.csv), and each list gets the
-# trailing "" pad described in the header comment.
+# Multi-valued cells are pipe-separated (see users.csv), and each list is sent as
+# it reads — no trailing "" pad; see the header comment.
 csv_json() {
   # Build "csvName=scimName,..." from ATTRS so the two never drift apart.
   local entry map=""
@@ -341,8 +349,7 @@ REQUIRED = ["username", "email", "first_name", "last_name", "password"]
 # `manager` is optional and single-valued: it names ONE userName, resolved to a
 # SCIM id in a second pass (see link_managers in the shell below). It is not a
 # custom attribute, so it is carried as a plain field rather than through
-# ATTR_MAP, and it is never padded — the client mapper returns
-# getManager().userName, a scalar string.
+# ATTR_MAP — the client mapper returns getManager().userName, a scalar string.
 OPTIONAL = ["manager"]
 
 # Custom attributes, in the order they are emitted. The CSV column keeps the
@@ -381,11 +388,11 @@ for i, row in enumerate(reader, start=2):
     attrs = {}
     for name, scim in ATTR_MAP:
         raw = (row.get(name) or "").strip()
-        vals = [v.strip() for v in raw.split("|") if v.strip()]
-        # THE PAD IS LOAD-BEARING. See the script header: without a second
-        # element Verify emits a scalar and Praxis's claim mapper silently
-        # drops the claim, which surfaces as a policy deny.
-        attrs[scim] = vals + [""]
+        # Sent unpadded. Verify still serialises a single value as a JSON scalar,
+        # but the engine's `ibmverify` claim-mapper preset now wraps a scalar into
+        # a one-element vec, so array shape no longer has to be forced here. See
+        # the script header.
+        attrs[scim] = [v.strip() for v in raw.split("|") if v.strip()]
     user["attributes"] = attrs
 
     # The manager cell names one userName. A pipe here is an operator assuming it
@@ -785,6 +792,6 @@ else
   echo "$(dim 'set above rather than a custom attribute — check it separately:')"
   echo "  $(dim './mint-verify-token.sh bob | cut -d. -f2 | base64 -d 2>/dev/null | jq .manager')"
   echo "$(dim 'Expect the STRING "alice". A missing claim means the client has no manager')"
-  echo "$(dim 'mapper (getManager().userName); [] or [""] means it was mapped like one of')"
-  echo "$(dim 'the padded set claims, which the CIBA login_hint cannot use.')"
+  echo "$(dim 'mapper (getManager().userName); [] or ["alice"] means it was mapped like one')"
+  echo "$(dim 'of the set claims, which the CIBA login_hint cannot use.')"
 fi

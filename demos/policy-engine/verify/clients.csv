@@ -25,8 +25,9 @@
 ## ---------------------------------------------------------------------------
 ## `manager` is mapped from a RELATIONSHIP, not from a custom attribute
 ## ---------------------------------------------------------------------------
-## The other four claims are sets read out of custom attributes, and their CELx
-## mappers pad them with a trailing "" to keep them array-shaped (see
+## The other four claims are sets read out of custom attributes through a CELx
+## mapper that returns getCustomValues() as-is — the trailing "" pad these used to
+## carry is gone, replaced by the engine's `ibmverify` claim-mapper preset (see
 ## import-verify-clients.sh). `manager` is different in kind: it is the SCIM
 ## EnterpriseUser manager reference, and its mapper traverses it —
 ##

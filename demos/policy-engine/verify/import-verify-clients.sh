@@ -79,30 +79,33 @@
 #    that CELx calls user.getCustomValues(<scimName>). See below.
 #
 # ---------------------------------------------------------------------------
-# THE EMPTY-STRING PADDING LIVES HERE, NOT IN THE USER DATA
+# THE EMPTY-STRING PADDING IS GONE — it used to live HERE, not in the user data
 # ---------------------------------------------------------------------------
-# verify/README.md and users.csv both describe a load-bearing trailing "" that
-# keeps single-valued claims array-shaped. Worth being precise about where it
-# actually comes from, because it changes what breaks if you edit it:
+# Historical note, because this pad is described in several places and it matters
+# which one actually minted it. The mappers below used to append `+ ['']`:
 #
-#   The tenant stores alice's roles as ["engineer"] — UNPADDED.
-#   Her minted token carries  roles: ["engineer", ""] — PADDED.
+#   The tenant stored alice's roles as ["engineer"] — UNPADDED.
+#   Her minted token carried  roles: ["engineer", ""] — PADDED.
 #
-# The pad is injected by the CELx mapper below (`+ ['']`), which is CLIENT
-# config. It is not in the SCIM user record. So:
+# The pad was CLIENT config, injected by the CELx mapper, never in the SCIM user
+# record. It existed because Praxis's standard claim mapper read
+# roles/teams/permissions via Value::as_array (claim_map.rs:222,248), which
+# returns None for a JSON scalar — so a single-valued persona got an EMPTY
+# subject.roles, require(role.hr) failed, and it presented as a policy deny
+# rather than the config fault it was. The accepted cost was that "" became a
+# real set member and appeared in audit records and X-Policy-* output.
 #
-#   - Recreating these clients WITHOUT the pad breaks every single-valued
-#     persona: Praxis's standard claim mapper reads roles/teams/permissions via
-#     Value::as_array (claim_map.rs:222,248), which returns None for a JSON
-#     scalar. subject.roles comes back EMPTY, require(role.hr) fails, and it
-#     presents as a policy deny rather than the config fault it is.
-#   - The cost, accepted knowingly: "" becomes a real set member and appears in
-#     audit records and X-Policy-* output.
+# The `ibmverify` claim-mapper preset fixes it at the source: it wraps a JSON
+# scalar into a one-element vec before the structured fields are read. The policy
+# selects it with `claim_mapper: ibmverify` on jwt-user and jwt-agent
+# (policy-verify-opa.yaml.tmpl), so SET_CEL below no longer pads.
 #
-# Remove the pad from PAD_CEL only once the upstream scalar->single-element-vec
-# fallback lands, and then from the mappers on the tenant too.
+# Two consequences. Clients created by an OLDER copy of this script still carry
+# padded mappers on the tenant — re-run this script to overwrite them, since the
+# mapper is what rebuilds the array. And pointing a gateway WITHOUT the preset at
+# unpadded mappers reintroduces the silent-empty-roles failure.
 #
-# ONE CLAIM IS EXEMPT: `manager`. It is not a custom attribute at all — it is the
+# ONE CLAIM WAS ALWAYS EXEMPT: `manager`. It is not a custom attribute at all — it is the
 # SCIM EnterpriseUser manager relationship, mapped with getManager().userName,
 # which yields a scalar string. Its consumer is
 # require_approval(from: claim.manager) in policy-verify-opa.yaml, which passes
@@ -383,15 +386,18 @@ CLIENTS_JSON="$(csv_json)" || die "failed to parse $CSV"
 CLIENT_COUNT=$(printf '%s' "$CLIENTS_JSON" | jq 'length')
 
 # --- claim mappers --------------------------------------------------------
-# The CELx body for one padded, array-shaped claim. %s is the scimName that
+# The CELx body for one set-valued claim. %s is the scimName that
 # user.getCustomValues() looks up — NOT necessarily the display name.
 #
-# The `+ ['']` is the load-bearing pad. See the header before touching it.
-PAD_CEL='statements:
+# This used to append `+ ['']` to force array shape at N=1. The `ibmverify`
+# claim-mapper preset now wraps a scalar into a one-element vec on the engine
+# side, so the pad is gone — see the header. The null guard stays: an attribute
+# the user simply does not have yields null, and the claim should be [] rather
+# than absent.
+SET_CEL='statements:
   - context: values := user.getCustomValues("%s")
   - context: "safeValues := context.values == null ? [] : context.values"
-  - context: "paddedValues := context.safeValues + ['\'''\'']"
-  - return: context.paddedValues'
+  - return: context.safeValues'
 
 # ---------------------------------------------------------------------------
 # `manager` is mapped from a RELATIONSHIP, not from a custom attribute
@@ -412,8 +418,9 @@ PAD_CEL='statements:
 #     apply, so this is a literal, not a printf template.
 #   - It returns a SCALAR string ("alice"), which is what
 #     require_approval(from: claim.manager) in policy-verify-opa.yaml needs — it
-#     hands the value to CIBA as the login_hint naming the human approver. A
-#     padded ["alice", ""] would be unusable there.
+#     hands the value to CIBA as the login_hint naming the human approver. An
+#     array ["alice"] would be unusable there, which is why this claim is mapped
+#     by MANAGER_CEL and never went through the set mapper.
 #   - There is nothing to resolve or validate against /v1.0/attributes, so
 #     resolve_scim_names() skips it. A missing manager RELATIONSHIP is a user-data
 #     problem that import-verify-users.sh reports, not a mapper problem.
@@ -509,14 +516,14 @@ app_payload() {
   while IFS= read -r claim; do
     [ -n "$claim" ] || continue
     # A relationship claim (manager) is mapped by traversal and takes no
-    # scimName; everything else reads a custom attribute through the padded
-    # array mapper. See RELATIONSHIP_CLAIMS.
+    # scimName; everything else reads a custom attribute through the set
+    # mapper. See RELATIONSHIP_CLAIMS.
     if is_relationship_claim "$claim"; then
       cel="$(relationship_cel "$claim")"
     else
       scim="$(scim_name_for "$claim")"
       # shellcheck disable=SC2059
-      cel="$(printf "$PAD_CEL" "$scim")"
+      cel="$(printf "$SET_CEL" "$scim")"
     fi
     mappers=$(printf '%s' "$mappers" | jq --arg t "$claim" --arg c "$cel" \
       '. + [{targetName: $t, function: {custom: $c}}]')
@@ -696,9 +703,9 @@ discover() {
   for entry in "${SCIM_MAP[@]}"; do
     claim="${entry%%=*}"; scim="${entry#*=}"
     if [ "$claim" = "$scim" ]; then
-      ok "$claim" "$(dim "getCustomValues(\"$scim\") -> padded array")"
+      ok "$claim" "$(dim "getCustomValues(\"$scim\") -> array")"
     else
-      warn "$claim" "$(dim "getCustomValues(\"$scim\") -> padded array — scimName differs from the display name")"
+      warn "$claim" "$(dim "getCustomValues(\"$scim\") -> array — scimName differs from the display name")"
     fi
   done
 }
