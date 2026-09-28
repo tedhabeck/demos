@@ -20,6 +20,7 @@
 #   ./import-verify-clients.sh --no-write-back  # do not touch post_deploy_variables.json
 #   ./import-verify-clients.sh --all-users      # entitle ALL tenant users, not just the personas
 #   ./import-verify-clients.sh --no-entitle     # skip entitlement entirely
+#   ./import-verify-clients.sh --no-purpose     # do not create the DPCM consent purpose
 #   ./import-verify-clients.sh --delete         # remove the CSV's clients
 #
 # Requires: curl, jq, python3 (CSV parsing only — no third-party packages).
@@ -38,7 +39,7 @@
 # .env.verify (gitignored) as VERIFY_ADMIN_CLIENT_ID / VERIFY_ADMIN_CLIENT_SECRET.
 #
 # ---------------------------------------------------------------------------
-# Four field-level facts, all confirmed against a live tenant
+# Five field-level facts, all confirmed against a live tenant
 # ---------------------------------------------------------------------------
 # These are the things that cost time to discover; the API reference documents
 # none of them completely. Each was verified by creating and deleting a throwaway
@@ -77,6 +78,69 @@
 #    mapping by attribute ID. The tenant's working clients use a different and
 #    undocumented shape — { targetName, function: { custom: <CELx> } } — and
 #    that CELx calls user.getCustomValues(<scimName>). See below.
+#
+# 5. The CONSENT request mapping is a DIFFERENT and flatter shape than the
+#    claim mappers in 4, which is the easy mistake here. It lives at
+#    providers.oidc.properties.additionalConfig.tokenRequestMap[] and its
+#    entries are { name, custom } — the CELx sits directly on the entry, with
+#    NO `function` wrapper and no `targetName`. `name` is the request PARAMETER
+#    being rewritten ("scope"), not a claim.
+#
+#    The tenant runs consentType "dpcm" (Data Privacy & Consent Management),
+#    so an exchange that narrows a token to an `audience` needs a consent
+#    grant for that audience. The mapping prepends an auto-granted purpose
+#    naming the requested audience onto the request's scope, then concatenates
+#    the real scope and authorization_details so nothing is lost. autoGrant
+#    keeps it non-interactive; the purpose id must match the `purpose=` that
+#    verify-ibm-verify-token-exchange.sh sends (P4AUD —
+#    VERIFY_CONSENT_PURPOSE_ID overrides both the payload and the --discover
+#    check). Confirmed on praxis-2: praxis-gateway, the only token-exchange
+#    client, is the only one of five applications carrying the field, so the
+#    script sets it only when token_exchange is on. consentType itself is
+#    tenant-wide and NOT managed here — --discover reports it.
+#
+# 4a. ...and the purpose must EXIST before the client that grants it
+#
+#    The tokenRequestMap names a purpose id; it does not define one. The purpose
+#    is a separate tenant resource under a DIFFERENT API base
+#    (/config/v1.0/privacy/purposes, not /v1.0/...), and this script now creates
+#    it — it was the last piece of tenant setup left manual, and its absence is
+#    hard to diagnose: the clients all create cleanly and the failure surfaces
+#    only at exchange time, from DPCM, as a consent error.
+#
+#    Two things about that API are worth knowing before editing it:
+#
+#      - POST always creates a DRAFT. The payload's `state` is ignored on
+#        create: the purpose reads back state=0/version=0/hasDraft=true, and a
+#        draft cannot be consented against. Publishing is a PATCH of the
+#        VERSIONED resource:
+#
+#          PATCH /config/v1.0/privacy/purposes/<id>/<version>
+#          {"op": "replace", "path": "state", "value": 1}
+#
+#        Three dead ends worth not repeating, all seen on a live tenant: a PUT
+#        or PATCH of the UNVERSIONED item means "create/update a draft", so it
+#        fails 403 CSIBT0024E ("Only one draft version for purpose is allowed")
+#        once a draft exists; state:1 in a PUT body is accepted (204) and
+#        silently does nothing; and `path` is the bare "state", not "/state"
+#        (CSIBT0026E) with the body a single object, not an RFC 6902 array.
+#        So create is POST-then-PATCH, and create_purpose() re-reads afterwards
+#        to confirm an activeVersion rather than trusting the 201.
+#      - A wrong path under this base returns HTTP 200 with an HTML
+#        login-redirect body, not a 404. api_dpcm() therefore sniffs the body and
+#        maps that to a synthetic 000; without it a typo reads as success.
+#
+#    An existing ACTIVE purpose is left untouched — republishing bumps the
+#    version and invalidates consents already granted against it. A leftover
+#    draft is published rather than reported as present. --no-purpose skips the
+#    whole step; --delete removes the purpose after the clients, since it cannot
+#    go while something still references it.
+#
+#    Mirrored from P4AUD as praxis-2 defines it: description "support
+#    request-scoped aud", defaultConsentDuration 365, tags request|aud|scope,
+#    category default, accessTypes [default], no attributes. Each is overridable
+#    (VERIFY_CONSENT_PURPOSE_*) so a tenant with its own wording does not need an
+#    edit here.
 #
 # ---------------------------------------------------------------------------
 # THE EMPTY-STRING PADDING IS GONE — it used to live HERE, not in the user data
@@ -195,10 +259,30 @@ WRITE_BACK=true
 # entirely for a tenant that manages application access out of band.
 ALL_USERS=false
 DO_ENTITLE=true
+# The DPCM purpose the exchange client auto-grants. Created before the clients;
+# --no-purpose skips it for a tenant that manages purposes out of band.
+DO_PURPOSE=true
 # Overridable so a tenant using a different custom-application template can be
 # targeted without editing the script; --discover reports what the tenant uses.
 TEMPLATE_ID="${VERIFY_APP_TEMPLATE_ID:-998}"
 SIGNING_ALG="${VERIFY_ACCESS_TOKEN_SIGNING_ALG:-RS256}"
+# DPCM purpose id auto-granted by the exchange client's tokenRequestMap (see
+# app_payload). Must match the `purpose=` that
+# verify-ibm-verify-token-exchange.sh sends on the exchange call.
+CONSENT_PURPOSE_ID="${VERIFY_CONSENT_PURPOSE_ID:-P4AUD}"
+# The purpose is a tenant resource in its own right, created before the clients
+# that reference it (see "the purpose must exist first" in the header). These
+# mirror P4AUD as praxis-2 defines it; --discover reports any drift.
+CONSENT_PURPOSE_NAME="${VERIFY_CONSENT_PURPOSE_NAME:-$CONSENT_PURPOSE_ID}"
+CONSENT_PURPOSE_DESC="${VERIFY_CONSENT_PURPOSE_DESC:-support request-scoped aud}"
+# Days a granted consent stays valid. 365 is the tenant's value; DPCM requires
+# the field, so there is no "unset".
+CONSENT_PURPOSE_DURATION="${VERIFY_CONSENT_PURPOSE_DURATION:-365}"
+# Pipe-separated, like the CSV's list columns.
+CONSENT_PURPOSE_TAGS="${VERIFY_CONSENT_PURPOSE_TAGS:-request|aud|scope}"
+# The access type the purpose is consented FOR. DPCM ships "default"; the
+# tokenRequestMap does not name one, so the purpose's own default applies.
+CONSENT_PURPOSE_ACCESS_TYPE="${VERIFY_CONSENT_PURPOSE_ACCESS_TYPE:-default}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -208,6 +292,7 @@ while [ $# -gt 0 ]; do
     --no-write-back) WRITE_BACK=false ;;
     --all-users)     ALL_USERS=true ;;
     --no-entitle)    DO_ENTITLE=false ;;
+    --no-purpose)    DO_PURPOSE=false ;;
     --csv)           CSV="${2:?--csv needs a path}"; shift ;;
     --template-id)   TEMPLATE_ID="${2:?--template-id needs a value}"; shift ;;
     # Print just the synopsis (down to the "Requires:" line), not the whole
@@ -533,6 +618,7 @@ app_payload() {
     --argjson i "$i" \
     --arg template "$TEMPLATE_ID" \
     --arg alg "$SIGNING_ALG" \
+    --arg purpose "$CONSENT_PURPOSE_ID" \
     --argjson mappers "$mappers" '
     .[$i] as $c
     | ($c.ropc           | if . then "true" else "false" end) as $ropc
@@ -604,7 +690,49 @@ app_payload() {
               + (if $c.token_exchange then {
                   subjectTokenTypes:   ["urn:ietf:params:oauth:token-type:access_token"],
                   actorTokenTypes:   ["urn:ietf:params:oauth:token-type:access_token"],
-                  requestedTokenTypes: ["urn:ietf:params:oauth:token-type:access_token"]
+                  requestedTokenTypes: ["urn:ietf:params:oauth:token-type:access_token"],
+                  # Consent request mapping. The tenant runs consentType "dpcm"
+                  # (Data Privacy & Consent Management), so an exchange that
+                  # narrows a token to an `audience` needs a matching consent
+                  # grant for that audience or DPCM has nothing to approve.
+                  # This rewrites the request'"'"'s `scope` to PREPEND a purpose
+                  # entry naming the requested audience, then concatenates the
+                  # real scope and authorization_details so nothing is dropped.
+                  #
+                  # Three things to know about the shape:
+                  #
+                  #  - Entries are FLAT { name, custom } — the `custom` CELx sits
+                  #    directly on the entry. This is NOT the attributeMappings
+                  #    shape ({ targetName, function: { custom } }); reusing that
+                  #    one here silently maps nothing.
+                  #  - `name` is the request parameter being rewritten ("scope"),
+                  #    not a claim name.
+                  #  - The ternary guard matters: requestContext.getValue(
+                  #    "audience") is "" on a plain client_credentials call, and
+                  #    emitting a purpose with an empty audience makes DPCM
+                  #    reject the request. Empty audience -> no purpose entry.
+                  #
+                  # autoGrant:true is what keeps the demo non-interactive: the
+                  # purpose is granted as part of the exchange instead of
+                  # queueing an approval. P4AUD is the tenant'"'"'s purpose id, and
+                  # is the same value verify-ibm-verify-token-exchange.sh sends
+                  # as `purpose=P4AUD` on the exchange call — the two must agree.
+                  #
+                  # Scoped to token_exchange clients: the audience placeholders
+                  # and the minting client never narrow by audience, so a
+                  # tokenRequestMap on them would be inert config. Confirmed
+                  # against praxis-2, where praxis-gateway is the only one of the
+                  # five applications carrying this field.
+                  tokenRequestMap: [
+                    {
+                      name: "scope",
+                      custom: ("(requestContext.getValue(\"audience\") != \"\" ? "
+                               + "[{\"purpose\": \"" + $purpose + "\", "
+                               + "\"audience\": requestContext.getValue(\"audience\"), "
+                               + "\"autoGrant\": true}] : []) "
+                               + "+ requestContext.scope + requestContext.authorization_details")
+                    }
+                  ]
                 } else {} end))
             },
             token: {
@@ -666,6 +794,50 @@ discover() {
     | "\(._links.self.href | sub("^.*/applications/"; ""))\t\(.name)"')"
 
   echo
+  echo "$(dim 'Consent purpose') $(dim "(the DPCM resource the tokenRequestMap grants against)")"
+  # Reported because a missing or draft purpose presents at exchange time as a
+  # consent failure, which looks like a client problem rather than this one.
+  local pstate pactive pfound
+  if pfound=$(find_purpose) && [ -n "$pfound" ]; then
+    pstate=$(printf '%s' "$pfound" | cut -f1)
+    pactive=$(printf '%s' "$pfound" | cut -f2)
+    if [ "$pstate" = "1" ] && [ -n "$pactive" ]; then
+      ok "$CONSENT_PURPOSE_ID" "$(dim "active v$pactive")"
+    else
+      warn "$CONSENT_PURPOSE_ID" "$(dim "state=$pstate, activeVersion=${pactive:-<none>} — a DRAFT; the exchange will fail at DPCM until it is published")"
+    fi
+  else
+    warn "$CONSENT_PURPOSE_ID" "$(dim 'not defined on this tenant — a run without --no-purpose creates it')"
+  fi
+
+  echo
+  echo "$(dim 'Consent') $(dim '(consentType + the exchange tokenRequestMap purpose)')"
+  # Reads back on GET, so unlike idTokenSigningAlg this one is discoverable.
+  # Shown because consentType is a TENANT-WIDE setting the script does not
+  # manage: if a tenant is not on "dpcm", the auto-granted purpose below is
+  # meaningless and the audience-narrowing exchange needs rethinking.
+  local ctype trmn trmp
+  while IFS=$'\t' read -r aid aname; do
+    [ -n "$aid" ] || continue
+    _split_resp "$(api GET "/v1.0/applications/$aid")"
+    ctype=$(printf '%s' "$RESP_BODY" | jq -r '.providers.oidc.properties.consentType // "-"')
+    trmn=$(printf '%s' "$RESP_BODY" | jq -r \
+      '[.providers.oidc.properties.additionalConfig.tokenRequestMap[]?.name] | join(",")')
+    # The purpose id is embedded in the CELx, not a field of its own.
+    trmp=$(printf '%s' "$RESP_BODY" | jq -r \
+      '[.providers.oidc.properties.additionalConfig.tokenRequestMap[]?.custom]
+       | join(" ") | capture("\"purpose\"\\s*:\\s*\"(?<p>[^\"]+)\"").p // empty' 2>/dev/null || true)
+    if [ -z "$trmn" ]; then
+      printf '  %-34s %s\n' "$aname" "$(dim "consentType=$ctype  tokenRequestMap=none")"
+    elif [ "$trmp" = "$CONSENT_PURPOSE_ID" ]; then
+      ok "$aname" "$(dim "consentType=$ctype  maps [$trmn]  purpose=$trmp")"
+    else
+      warn "$aname" "$(dim "consentType=$ctype  maps [$trmn]  purpose=${trmp:-<none>} — script sends $CONSENT_PURPOSE_ID")"
+    fi
+  done <<< "$(printf '%s' "$RESP_BODY_LIST" | jq -r '._embedded.applications[]?
+    | "\(._links.self.href | sub("^.*/applications/"; ""))\t\(.name)"')"
+
+  echo
   echo "$(dim 'Application entitlement') $(dim '(who may sign on — GET /v1.0/owner/applications/<id>/entitlements)')"
   while IFS=$'\t' read -r aid aname; do
     [ -n "$aid" ] || continue
@@ -708,6 +880,242 @@ discover() {
       warn "$claim" "$(dim "getCustomValues(\"$scim\") -> array — scimName differs from the display name")"
     fi
   done
+}
+
+# ==========================================================================
+# consent purpose
+# ==========================================================================
+# The DPCM purpose the exchange client's tokenRequestMap auto-grants. It is a
+# tenant resource, NOT part of the application, and it lives behind a different
+# API than everything else this script touches:
+#
+#   /config/v1.0/privacy/purposes        POST, GET   (collection)
+#   /config/v1.0/privacy/purposes/<id>   PUT, GET, DELETE
+#
+# Confirmed by OPTIONS on a live tenant. Note the shape: the base is
+# /config/v1.0/..., not /v1.0/... like the Applications API, so it does NOT go
+# through api() — see api_dpcm(). A wrong path here does not 404; the tenant
+# serves an HTML login-redirect page with HTTP 200, which is why api_dpcm()
+# checks the content type rather than trusting the status code.
+#
+# ---------------------------------------------------------------------------
+# Create is two calls, because POST only ever creates a DRAFT
+# ---------------------------------------------------------------------------
+# A purpose is versioned, and POST always lands a draft regardless of what the
+# payload says:
+#
+#   POST {... "state": 1 ...}  ->  201, then GET shows
+#                                  state=0, version=0, activeVersion=null,
+#                                  hasDraft=true
+#
+# A draft purpose exists but cannot be consented against, so the exchange would
+# still fail — and it fails at DPCM, which reads as a consent problem rather
+# than a provisioning one. The published tenant purpose reads back as
+# state=1, version=1, activeVersion=1, hasDraft=false.
+#
+# Publishing is a PATCH of the VERSIONED item flipping state to 1 — see
+# publish_purpose() for the exact call and the three shapes that do NOT work.
+# create_purpose() therefore POSTs, reads the draft's version back, PATCHes, and
+# only reports success once a further read shows an activeVersion.
+PURPOSE_PATH="/config/v1.0/privacy/purposes"
+
+# Like api(), but for the /config/v1.0 DPCM base and with one extra guard: an
+# unknown path under this base returns HTTP 200 with an HTML login-redirect
+# body instead of a 404, so a typo would otherwise look like success and then
+# fail jq parsing further down. Maps that case to a synthetic 000.
+api_dpcm() {
+  local method="$1" path="$2" body="${3:-}"
+  local -a args=(-sS -o - -w $'\n%{http_code}' -X "$method" "${TENANT_URL}${path}"
+    -H "Authorization: Bearer $ACCESS_TOKEN"
+    -H "Accept: application/json")
+  if [ -n "$body" ]; then
+    args+=(-H "Content-Type: application/json" --data "$body")
+  fi
+  local raw
+  raw="$(curl "${args[@]}")" || return 1
+  case "${raw%$'\n'*}" in
+    '<!DOCTYPE html>'*|'<html'*)
+      printf 'the tenant served an HTML login-redirect for %s (DPCM API path or entitlement is wrong)\n000\n' "$path"
+      return 0 ;;
+  esac
+  printf '%s\n' "$raw"
+}
+
+# The create body. `state: 1` is sent even though POST ignores it: the PUT that
+# publishes reuses this same payload, and a body that disagrees with itself
+# between the two calls is worse than a field the first call drops.
+purpose_payload() {
+  jq -n \
+    --arg id       "$CONSENT_PURPOSE_ID" \
+    --arg name     "$CONSENT_PURPOSE_NAME" \
+    --arg desc     "$CONSENT_PURPOSE_DESC" \
+    --arg access   "$CONSENT_PURPOSE_ACCESS_TYPE" \
+    --arg tags     "$CONSENT_PURPOSE_TAGS" \
+    --argjson days "$CONSENT_PURPOSE_DURATION" '
+    {
+      id: $id,
+      name: $name,
+      description: $desc,
+      # 1 = active. Ignored by POST (always a draft), honoured by the PUT.
+      state: 1,
+      defaultConsentDuration: $days,
+      # Whether an existing consent for an earlier version carries forward. The
+      # tenant has this false, and for an auto-granted purpose it is moot.
+      previousConsentApply: false,
+      tags: ($tags | split("|") | map(select(length > 0))),
+      category: "default",
+      accessTypes: [{ id: $access }],
+      # No attributes: the purpose governs an audience, not a set of PII
+      # attributes, so there is nothing to enumerate. An empty list is required
+      # rather than omitted.
+      attributes: [],
+      customAttributes: []
+    }'
+}
+
+# "<state>\t<activeVersion>\t<version>" for the purpose, or empty if it does not
+# exist. All three matter: a draft left behind by a half-finished run exists but
+# has activeVersion=null, and publishing it needs its version number for the
+# PATCH path (see publish_purpose).
+find_purpose() {
+  _split_resp "$(api_dpcm GET "${PURPOSE_PATH}/${CONSENT_PURPOSE_ID}")"
+  [ "$RESP_STATUS" = "200" ] || return 1
+  printf '%s' "$RESP_BODY" | jq -r '"\(.state // 0)\t\(.activeVersion // "")\t\(.version // 0)"'
+}
+
+# Publish the draft at version $1 by flipping its state to active.
+#
+# This is a PATCH of the VERSIONED resource, and neither half of that is
+# guessable — both were established against a live tenant:
+#
+#   PATCH /config/v1.0/privacy/purposes/<id>/<version>
+#   {"op": "replace", "path": "state", "value": 1}          -> 204
+#
+#   - The version belongs in the PATH. A PUT or PATCH of the unversioned item
+#     is "create/update a draft", NOT publish: it answers 403 CSIBT0024E
+#     ("Only one draft version for purpose is allowed") because a draft already
+#     exists. Putting state:1 in a PUT body does nothing either — the PUT
+#     returns 204 and the purpose stays state=0.
+#   - `path` is the bare field name "state", not JSON-Pointer "/state" (which
+#     the API rejects: CSIBT0026E, "Valid input is [state]"), and the body is a
+#     single object, not the RFC 6902 array (which reports `op` missing).
+#
+# After this the purpose reads state=1, version=1, activeVersion=1,
+# hasDraft=false — the shape a published purpose has.
+publish_purpose() {
+  local version="$1"
+  _split_resp "$(api_dpcm PATCH "${PURPOSE_PATH}/${CONSENT_PURPOSE_ID}/${version}" \
+    '{"op":"replace","path":"state","value":1}')"
+  case "$RESP_STATUS" in
+    200|204) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+create_purpose() {
+  echo
+  echo "$(dim 'Consent purpose') $(dim "-> ${TENANT_URL}${PURPOSE_PATH}")"
+  local body existing state active draftver
+
+  body="$(purpose_payload)"
+
+  if [ "$DRY_RUN" = true ]; then
+    ok "$CONSENT_PURPOSE_ID" "$(dim 'dry-run — POST the draft, then PATCH state=1 to publish')"
+    printf '%s\n' "$body" | jq . | sed 's/^/      /'
+    return 0
+  fi
+
+  # Idempotent, like the client create: an existing ACTIVE purpose is left
+  # alone. Overwriting it would bump the version and invalidate consents already
+  # granted against it, which is not something a provisioning re-run should do.
+  if existing=$(find_purpose) && [ -n "$existing" ]; then
+    state=$(printf '%s' "$existing" | cut -f1)
+    active=$(printf '%s' "$existing" | cut -f2)
+    draftver=$(printf '%s' "$existing" | cut -f3)
+    if [ -n "$active" ] && [ "$state" = "1" ]; then
+      warn "$CONSENT_PURPOSE_ID" "$(dim "exists (active v$active) — left unchanged")"
+      return 0
+    fi
+    # Present but unpublished: finish the job instead of reporting a false pass.
+    warn "$CONSENT_PURPOSE_ID" "$(dim "exists as an unpublished draft (v$draftver) — publishing")"
+    if publish_purpose "$draftver"; then
+      ok "$CONSENT_PURPOSE_ID" "$(dim 'published')"
+      return 0
+    fi
+    fail "$CONSENT_PURPOSE_ID" "HTTP $RESP_STATUS publishing the existing draft"
+    printf '%s\n' "$RESP_BODY" | jq . 2>/dev/null | sed 's/^/      /' \
+      || printf '      %s\n' "$RESP_BODY"
+    die "could not publish the '$CONSENT_PURPOSE_ID' draft"
+  fi
+
+  _split_resp "$(api_dpcm POST "$PURPOSE_PATH" "$body")"
+  case "$RESP_STATUS" in
+    200|201)
+      # Created as a draft. Publishing needs the draft's version in the PATCH
+      # path and the 201 body is empty, so read it back rather than assuming 0.
+      if ! existing=$(find_purpose) || [ -z "$existing" ]; then
+        fail "$CONSENT_PURPOSE_ID" 'created but could not be read back to publish'
+        die "purpose '$CONSENT_PURPOSE_ID' exists only as a draft — the exchange will fail at DPCM"
+      fi
+      draftver=$(printf '%s' "$existing" | cut -f3)
+      # Publish, then prove it took: an unpublished purpose fails at exchange
+      # time as a consent error, far from here.
+      if ! publish_purpose "$draftver"; then
+        fail "$CONSENT_PURPOSE_ID" "created as a draft but HTTP $RESP_STATUS publishing it"
+        printf '%s\n' "$RESP_BODY" | jq . 2>/dev/null | sed 's/^/      /' \
+          || printf '      %s\n' "$RESP_BODY"
+        die "purpose '$CONSENT_PURPOSE_ID' exists only as a draft — the exchange will fail at DPCM"
+      fi
+      if existing=$(find_purpose) \
+         && [ "$(printf '%s' "$existing" | cut -f1)" = "1" ] \
+         && [ -n "$(printf '%s' "$existing" | cut -f2)" ]; then
+        ok "$CONSENT_PURPOSE_ID" \
+           "$(dim "created and published (active v$(printf '%s' "$existing" | cut -f2))")"
+      else
+        fail "$CONSENT_PURPOSE_ID" 'created but did not read back as active'
+        die "purpose '$CONSENT_PURPOSE_ID' is not active — check the console under Data privacy & consent"
+      fi ;;
+    # The collection POST reports a duplicate this way. Reachable when a purpose
+    # is created between find_purpose() and here.
+    409)
+      warn "$CONSENT_PURPOSE_ID" "$(dim 'already exists (409) — left unchanged')" ;;
+    403)
+      fail "$CONSENT_PURPOSE_ID" "HTTP 403 — the API client cannot manage privacy purposes"
+      echo "$(dim '      Grant the admin API client the DPCM configuration entitlement')" >&2
+      echo "$(dim '      ("Manage privacy purposes" / Data Privacy & Consent config) and re-run.')" >&2
+      die "insufficient entitlements for $PURPOSE_PATH" ;;
+    000)
+      fail "$CONSENT_PURPOSE_ID" 'the DPCM API did not answer with JSON'
+      printf '      %s\n' "$RESP_BODY"
+      die "cannot reach the purposes API at $PURPOSE_PATH" ;;
+    *)
+      fail "$CONSENT_PURPOSE_ID" "HTTP $RESP_STATUS"
+      printf '%s\n' "$RESP_BODY" | jq . 2>/dev/null | sed 's/^/      /' \
+        || printf '      %s\n' "$RESP_BODY"
+      die "unexpected response creating purpose '$CONSENT_PURPOSE_ID'" ;;
+  esac
+}
+
+delete_purpose() {
+  echo
+  echo "$(yellow 'Deleting') $(dim "purpose $CONSENT_PURPOSE_ID from ${TENANT_URL}")"
+
+  if [ "$DRY_RUN" = true ]; then
+    ok "$CONSENT_PURPOSE_ID" "$(dim "(dry-run) would DELETE ${PURPOSE_PATH}/${CONSENT_PURPOSE_ID}")"
+    return 0
+  fi
+
+  _split_resp "$(api_dpcm DELETE "${PURPOSE_PATH}/${CONSENT_PURPOSE_ID}")"
+  case "$RESP_STATUS" in
+    200|204) ok   "$CONSENT_PURPOSE_ID" "$(dim 'deleted')" ;;
+    404)     warn "$CONSENT_PURPOSE_ID" "$(dim 'not present — nothing to delete')" ;;
+    # A purpose with consents recorded against it cannot be removed. Not fatal:
+    # --delete is about the demo's clients, and a lingering purpose is inert.
+    409)     warn "$CONSENT_PURPOSE_ID" "$(dim 'in use (409) — left in place')" ;;
+    *)       fail "$CONSENT_PURPOSE_ID" "HTTP $RESP_STATUS"
+             printf '%s\n' "$RESP_BODY" | jq . 2>/dev/null | sed 's/^/      /' \
+               || printf '      %s\n' "$RESP_BODY" ;;
+  esac
 }
 
 # ==========================================================================
@@ -1049,7 +1457,16 @@ fi
 
 if [ "$DO_DELETE" = true ]; then
   delete_clients
+  # After the clients: the purpose is only deletable once nothing references it.
+  if [ "$DO_PURPOSE" = true ]; then
+    delete_purpose
+  fi
 else
+  # Before the clients. The exchange client's tokenRequestMap names this purpose,
+  # and a grant against a purpose that does not exist fails at DPCM.
+  if [ "$DO_PURPOSE" = true ]; then
+    create_purpose
+  fi
   create_clients
   if [ "$WRITE_BACK" = true ]; then
     write_back

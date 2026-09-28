@@ -73,7 +73,8 @@ exchange_resp=$(curl -s -X POST "$TOKEN_ENDPOINT" \
   -d "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
   -d "subject_token=$alice_token" \
   -d "subject_token_type=urn:ietf:params:oauth:token-type:access_token" \
-  -d "audience=$AUDIENCE")
+  -d "audience=$AUDIENCE" \
+  -d "purpose=P4AUD")
 
 minted=$(echo "$exchange_resp" | jq -r '.access_token // empty')
 if [ -z "$minted" ]; then
