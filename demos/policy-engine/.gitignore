@@ -1,5 +1,8 @@
-# gateway stdout/stderr captured by restart.sh
+# gateway stdout/stderr captured by restart.sh. The real file lives in .gwlog/
+# and gateway.log is a symlink to it, to keep log writes out of the directory
+# the gateway's config watcher watches — see the GATEWAY_LOG note in restart.sh.
 gateway.log
+.gwlog/
 
 # Python virtualenv + caches for the agent/ chat client
 agent/.venv/
