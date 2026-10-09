@@ -101,12 +101,14 @@ if [ "${USE_VERIFY:-}" = "true" ]; then
       echo "  $(yellow ✗) the gateway does not trust the Verify issuer"
       echo "  $(dim "USE_VERIFY switches token minting only — the gateway needs its own config:")"
       echo "  $(dim "USE_VERIFY=true GATEWAY_CONFIG=praxis-verify-opa.yaml ./restart.sh")"
+      echo "  $(dim "(or praxis-verify-cel.yaml / praxis-verify-cedar.yaml for those PDPs)")"
       exit 1
       ;;
     *delegation.idp_rejected*)
       echo "  $(yellow ✗) the gateway trusts Verify but exchanges tokens elsewhere"
       echo "  $(dim "a Keycloak delegator cannot exchange a Verify-minted token:")"
       echo "  $(dim "USE_VERIFY=true GATEWAY_CONFIG=praxis-verify-opa.yaml ./restart.sh")"
+      echo "  $(dim "(or praxis-verify-cel.yaml / praxis-verify-cedar.yaml for those PDPs)")"
       exit 1
       ;;
   esac

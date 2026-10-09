@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Render policy-verify-opa.yaml from policy-verify-opa.yaml.tmpl.
+# Render policy-verify-<variant>.yaml from policy-verify-<variant>.yaml.tmpl,
+# for each of the three PDP variants on the IBM Verify path (opa, cel, cedar).
 #
 # The Verify path's tenant URL and exchange client_id are tenant-specific, and
 # Verify GENERATES client ids — so a rebuilt tenant invalidates whatever is
@@ -9,14 +10,22 @@
 # substitution has to happen before the gateway reads the file. This script is
 # that step.
 #
-# Usage:
-#   ./render-verify-config.sh              # render, skipping an up-to-date file
-#   ./render-verify-config.sh --force      # re-render even if up to date
-#   ./render-verify-config.sh --check      # verify only; non-zero if stale
-#   ./render-verify-config.sh --print      # render to stdout, write nothing
+# The two substituted values are variant-independent, so they are resolved once
+# and every selected variant gets the same tenant and client id.
 #
-# restart.sh calls this automatically for any *verify* GATEWAY_CONFIG, so the
-# normal path needs nothing.
+# Usage:
+#   ./render-verify-config.sh              # render all three, skipping up-to-date
+#   ./render-verify-config.sh cel          # render only the CEL variant
+#   ./render-verify-config.sh opa cedar    # render a subset
+#   ./render-verify-config.sh --force      # re-render even if up to date
+#   ./render-verify-config.sh --check      # verify only; non-zero if any stale
+#   ./render-verify-config.sh --print cel  # render to stdout, write nothing
+#
+# --print needs exactly one variant: concatenating three policy documents onto
+# one stream produces a file that is not a valid config for anything.
+#
+# restart.sh calls this automatically for any *verify* GATEWAY_CONFIG, passing
+# the variant that matches it, so the normal path needs nothing.
 #
 # Requires: python3 (already required by verify/import-verify-*.sh).
 # Deliberately NOT envsubst: that is gettext, absent from a stock macOS and from
@@ -38,28 +47,74 @@
 # The Keycloak CIBA endpoints in the template are literal localhost URLs and are
 # NOT templated — that plugin still points at Keycloak (see the note in the
 # template), so templating them would imply a portability that does not exist.
+#
+# ---------------------------------------------------------------------------
+# Two kinds of ${...}, and why the distinction is load-bearing
+# ---------------------------------------------------------------------------
+# The Cedar template writes `id: ${args.repo_name}` — a PRAXIS interpolation,
+# resolved per-request by the gateway from the live tool args. It must survive
+# into the rendered file untouched.
+#
+# So the two namespaces are split by case, which is why the convention is worth
+# keeping:
+#
+#   ${UPPER_SNAKE}   this script's placeholders. Unknown ones abort the render,
+#                    and any left unsubstituted abort it too.
+#   ${anything.else} Praxis's own, passed through verbatim.
+#
+# The strictness on the first is the point: an unresolved ${VERIFY_...} would
+# reach the gateway as a literal string, pass the non-empty client_id check, and
+# fail much later at the token endpoint as invalid_client — a long way from the
+# typo that caused it.
 
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-TMPL="policy-verify-opa.yaml.tmpl"
-OUT="policy-verify-opa.yaml"
 PDV="post_deploy_variables.json"
+
+# The variants, in the order they are rendered and reported. A variant is just a
+# (template, output) pair sharing one tenant and client id, so adding a fourth
+# PDP means one entry here and one template file — nothing else in this script.
+ALL_VARIANTS=(opa cel cedar)
+
+tmpl_for() { echo "policy-verify-$1.yaml.tmpl"; }
+out_for()  { echo "policy-verify-$1.yaml"; }
+
+is_variant() {
+  local v
+  for v in "${ALL_VARIANTS[@]}"; do [ "$1" = "$v" ] && return 0; done
+  return 1
+}
 
 FORCE=false
 CHECK=false
 PRINT=false
+VARIANTS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --force) FORCE=true ;;
     --check) CHECK=true ;;
     --print) PRINT=true ;;
     -h|--help) sed -n '2,/^# Requires:/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) echo "unknown option: $1" >&2; exit 2 ;;
+    -*) echo "unknown option: $1" >&2; exit 2 ;;
+    *)
+      if is_variant "$1"; then
+        VARIANTS+=("$1")
+      else
+        echo "unknown variant: $1 (expected one of: ${ALL_VARIANTS[*]})" >&2
+        exit 2
+      fi
+      ;;
   esac
   shift
 done
+
+# No variant named means all of them, so a bare run and `--check` stay
+# whole-world operations.
+if [ "${#VARIANTS[@]}" -eq 0 ]; then
+  VARIANTS=("${ALL_VARIANTS[@]}")
+fi
 
 red()   { printf '\033[31m%s\033[0m' "$*"; }
 green() { printf '\033[32m%s\033[0m' "$*"; }
@@ -67,7 +122,17 @@ dim()   { printf '\033[2m%s\033[0m' "$*"; }
 die()   { echo "$(red 'fatal:') $*" >&2; exit 1; }
 
 command -v python3 >/dev/null 2>&1 || die "python3 is required but not on PATH"
-[ -f "$TMPL" ] || die "template not found: $TMPL"
+
+for _v in "${VARIANTS[@]}"; do
+  _t="$(tmpl_for "$_v")"
+  [ -f "$_t" ] || die "template not found: $_t"
+done
+
+# Three policy documents on one stdout is not a valid config for anything, so
+# --print insists on a single variant rather than silently producing garbage.
+if [ "$PRINT" = true ] && [ "${#VARIANTS[@]}" -ne 1 ]; then
+  die "--print needs exactly one variant (one of: ${ALL_VARIANTS[*]})"
+fi
 
 # --- resolve the two values ------------------------------------------------
 # An already-exported value wins, so a one-off run or CI can override without
@@ -105,12 +170,15 @@ case "$TENANT_URL" in
 esac
 
 # --- render ---------------------------------------------------------------
-# Substitute exactly the two known placeholders, then assert none remain. A
-# leftover ${...} would otherwise reach the gateway as a literal string: an
-# unresolved client_id passes the non-empty check and fails much later at the
+# Substitute exactly the two known placeholders, then assert no ${UPPER_SNAKE}
+# remains. A leftover one would otherwise reach the gateway as a literal string:
+# an unresolved client_id passes the non-empty check and fails much later at the
 # token endpoint as invalid_client.
+#
+# Praxis's own ${args.*} interpolations are lower-case and dotted, and are
+# deliberately left alone — see the namespace note in the header.
 render() {
-  python3 - "$TMPL" "$TENANT_URL" "$CLIENT_ID" <<'PY'
+  python3 -I - "$1" "$TENANT_URL" "$CLIENT_ID" <<'PY'
 import re, sys
 
 tmpl_path, tenant_url, client_id = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -122,13 +190,14 @@ mapping = {
     "VERIFY_GATEWAY_CLIENT_ID": client_id,
 }
 
-# Only ${NAME} placeholders, and only the two we know. Anything else is a typo
-# or a new variable someone forgot to wire up, and must not pass silently.
-unknown = {
-    m.group(1)
-    for m in re.finditer(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", text)
-    if m.group(1) not in mapping
-}
+# This script owns the ${UPPER_SNAKE} namespace; Praxis owns everything else
+# (e.g. ${args.repo_name} in the Cedar template, resolved per-request by the
+# gateway). Matching only UPPER_SNAKE keeps the two from colliding.
+OURS = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
+
+# Within our own namespace, an unrecognised name is a typo or a new variable
+# someone forgot to wire up, and must not pass silently.
+unknown = {m.group(1) for m in OURS.finditer(text) if m.group(1) not in mapping}
 if unknown:
     sys.exit("template references unknown variable(s): "
              + ", ".join(sorted(unknown))
@@ -137,9 +206,9 @@ if unknown:
 for name, value in mapping.items():
     text = text.replace("${" + name + "}", value)
 
-leftover = re.findall(r"\$\{[^}]*\}", text)
+leftover = sorted({m.group(0) for m in OURS.finditer(text)})
 if leftover:
-    sys.exit("unsubstituted placeholder(s) remain: " + ", ".join(sorted(set(leftover))))
+    sys.exit("unsubstituted placeholder(s) remain: " + ", ".join(leftover))
 
 # The generated file must not be edited by hand, and it is gitignored — say both
 # at the top, since that is the only place a reader will look.
@@ -159,32 +228,50 @@ PY
 }
 
 if [ "$PRINT" = true ]; then
-  render
+  # Arity already checked above, so there is exactly one.
+  render "$(tmpl_for "${VARIANTS[0]}")"
   exit 0
 fi
 
-NEW="$(render)" || exit 1
+# One variant per iteration. A failure in one is recorded and the rest still
+# run: on a --check that means the report names every stale file rather than
+# only the first, and on a render it means one broken template does not hide
+# the state of the others.
+STALE=0
 
-if [ "$CHECK" = true ]; then
-  if [ -f "$OUT" ] && [ "$NEW" = "$(cat "$OUT")" ]; then
-    echo "  $(green ✓) $OUT is up to date"
-    exit 0
+for variant in "${VARIANTS[@]}"; do
+  tmpl="$(tmpl_for "$variant")"
+  out="$(out_for "$variant")"
+
+  if ! NEW="$(render "$tmpl")"; then
+    STALE=1
+    continue
   fi
-  echo "  $(red ✗) $OUT is missing or stale — run ./render-verify-config.sh" >&2
-  exit 1
-fi
 
-if [ "$FORCE" = false ] && [ -f "$OUT" ] && [ "$NEW" = "$(cat "$OUT")" ]; then
-  echo "  $(green ✓) $OUT $(dim 'already up to date')"
-  exit 0
-fi
+  if [ -f "$out" ] && [ "$NEW" = "$(cat "$out")" ]; then
+    if [ "$CHECK" = true ]; then
+      echo "  $(green ✓) $out is up to date"
+      continue
+    fi
+    if [ "$FORCE" = false ]; then
+      echo "  $(green ✓) $out $(dim 'already up to date')"
+      continue
+    fi
+  elif [ "$CHECK" = true ]; then
+    echo "  $(red ✗) $out is missing or stale — run ./render-verify-config.sh $variant" >&2
+    STALE=1
+    continue
+  fi
 
-# Warn before clobbering a hand-edited file that predates the template, so the
-# edits can be moved into the .tmpl rather than silently lost.
-if [ -f "$OUT" ] && ! head -1 "$OUT" | grep -q 'GENERATED FILE'; then
-  echo "  $(red '!') $OUT exists and was NOT generated by this script." >&2
-  echo "      Overwriting it. If it has hand edits, move them into $TMPL." >&2
-fi
+  # Warn before clobbering a hand-edited file that predates the template, so the
+  # edits can be moved into the .tmpl rather than silently lost.
+  if [ -f "$out" ] && ! head -1 "$out" | grep -q 'GENERATED FILE'; then
+    echo "  $(red '!') $out exists and was NOT generated by this script." >&2
+    echo "      Overwriting it. If it has hand edits, move them into $tmpl." >&2
+  fi
 
-printf '%s\n' "$NEW" > "$OUT"
-echo "  $(green ✓) rendered $OUT $(dim "(tenant ${TENANT_URL}, client ${CLIENT_ID:0:8}…)")"
+  printf '%s\n' "$NEW" > "$out"
+  echo "  $(green ✓) rendered $out $(dim "(tenant ${TENANT_URL}, client ${CLIENT_ID:0:8}…)")"
+done
+
+exit "$STALE"

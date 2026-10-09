@@ -14,9 +14,14 @@ post_deploy_variables.json
 # IBM Verify tenant client secret for the Verify IdP path
 .env.verify
 
-# Generated from policy-verify-opa.yaml.tmpl by render-verify-config.sh. The
-# tenant URL and exchange client_id are tenant-specific, and Verify generates
-# client ids, so the rendered file is per-tenant rather than shared. Edit the
-# .tmpl. NOTE: this file was tracked before the template existed — the ignore
-# only takes effect after `git rm --cached policy-verify-opa.yaml`.
+# Generated from the matching .yaml.tmpl by render-verify-config.sh, one per PDP
+# variant on the Verify path. The tenant URL and exchange client_id are
+# tenant-specific, and Verify generates client ids, so a rendered file is
+# per-tenant rather than shared. Edit the .tmpl.
+#
+# NOTE: policy-verify-opa.yaml was tracked before the template existed — its
+# ignore only takes effect after `git rm --cached policy-verify-opa.yaml`. The
+# cel and cedar files were never tracked, so they need no such step.
 policy-verify-opa.yaml
+policy-verify-cel.yaml
+policy-verify-cedar.yaml

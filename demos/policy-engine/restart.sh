@@ -34,9 +34,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-# Which praxis config to run. Defaults to the OPA/Rego PDP (praxis-opa.yaml);
-# set GATEWAY_CONFIG=praxis.yaml or praxis-cel.yaml for the Cedar and CEL
-# PDP variants, or praxis-verify-opa.yaml for the IBM Verify IdP path.
+# Which praxis config to run. Six configs cover the 2x3 matrix of IdP x PDP;
+# this defaults to Keycloak + OPA/Rego (praxis-opa.yaml):
+#
+#                   Cedar                    CEL                    OPA/Rego
+#   Keycloak        praxis.yaml              praxis-cel.yaml        praxis-opa.yaml
+#   IBM Verify      praxis-verify-cedar.yaml praxis-verify-cel.yaml praxis-verify-opa.yaml
+#
+# The *verify* configs also need USE_VERIFY=true so the scenario scripts mint
+# from the same IdP the gateway trusts — see praxis-verify-opa.yaml.
 GATEWAY_CONFIG="${GATEWAY_CONFIG:-praxis-opa.yaml}"
 
 # The Verify path's delegators read their client secret from the environment
@@ -107,14 +113,29 @@ case "$GATEWAY_CONFIG" in
       echo "  cp .env.verify.example .env.verify   # then fill in the secret" >&2
       exit 1
     fi
-    # policy-verify-opa.yaml is generated from policy-verify-opa.yaml.tmpl: the
+    # The policy-verify-*.yaml documents are generated from their .tmpl: the
     # tenant URL and the exchange client_id are tenant-specific, and Verify
     # GENERATES client ids, so a rebuilt tenant invalidates whatever was
     # committed. Praxis has no env-var indirection for client_id (only for the
     # secret), so substitution happens here, before the gateway reads the file.
     # Rendering is idempotent and quiet when nothing changed.
+    #
+    # Render only the variant this config actually loads, so a CEL run does not
+    # fail on an unrelated broken template.
+    case "$GATEWAY_CONFIG" in
+      *verify-cel*)   VERIFY_VARIANT=cel ;;
+      *verify-cedar*) VERIFY_VARIANT=cedar ;;
+      *verify-opa*)   VERIFY_VARIANT=opa ;;
+      *)
+        # A *verify* config with no recognised PDP suffix. Render everything
+        # rather than guess: the cost is two extra renders, and the alternative
+        # is starting the gateway against a stale file.
+        VERIFY_VARIANT="" ;;
+    esac
     step "rendering $GATEWAY_CONFIG's policy config from its template"
-    ./render-verify-config.sh || die "could not render policy-verify-opa.yaml"
+    # shellcheck disable=SC2086 # intentionally unquoted: empty means "all"
+    ./render-verify-config.sh $VERIFY_VARIANT \
+      || die "could not render the policy config for $GATEWAY_CONFIG"
     ;;
 esac
 

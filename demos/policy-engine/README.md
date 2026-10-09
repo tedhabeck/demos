@@ -151,6 +151,9 @@ To check every scenario instead of watching the tour:
 ```bash
 ./run-scenarios.sh                 # the running gateway
 ./run-scenarios.sh --all-configs   # Cedar, then CEL, then OPA
+
+# same PDP sweep against IBM Verify instead of Keycloak
+USE_VERIFY=true ./run-scenarios.sh --all-configs
 ```
 
 The equivalent steps, spelled out:
@@ -284,6 +287,58 @@ Both PDP backends are compiled into the same binary. The config's
 `pdp: { kind: ... }` and the route's `cedar:` or `cel:` step select which one
 runs. The CEL step also shows an `on_deny:` reaction attaching a human reason and
 a stable violation code; `on_deny` and `on_allow` work on any PDP step.
+
+## Swapping the IdP: IBM Verify instead of Keycloak
+
+The PDP is one axis; the identity provider is another, and they are independent.
+Each of the three PDP configs has an IBM Verify counterpart, giving six configs:
+
+| | Cedar | CEL | OPA/Rego |
+|---|---|---|---|
+| **Keycloak** (local, `:8081`) | `praxis.yaml` | `praxis-cel.yaml` | `praxis-opa.yaml` |
+| **IBM Verify** (live tenant) | `praxis-verify-cedar.yaml` | `praxis-verify-cel.yaml` | `praxis-verify-opa.yaml` |
+
+```bash
+USE_VERIFY=true GATEWAY_CONFIG=praxis-verify-cedar.yaml ./restart.sh
+./scenarios/04-alice-internal-allow.sh        # 200 allow
+./scenarios/05-alice-external-cedar-deny.sh   # -32001 deny, violation cedar.default_deny
+```
+
+**Both switches are required, and they cover different halves of the path:**
+`GATEWAY_CONFIG` picks which IdP the *gateway* validates and exchanges against;
+`USE_VERIFY` picks which IdP the *scenario scripts* mint from. Mismatch them and
+the failure is at least legible — minting from Keycloak against a Verify-only
+gateway yields `auth.untrusted_issuer`.
+
+The argument here is what does *not* change. Diff a Verify policy document
+against its Keycloak sibling and every difference falls in the identity and
+delegation blocks — the routes, the PDP rule, the PII scanner, the redaction
+rules, the taint labels and the audit logger are identical:
+
+```bash
+diff policy-verify-cedar.yaml policy-cedar.yaml
+```
+
+Three things to know before demoing the Verify path:
+
+- **The policy documents are generated.** `policy-verify-*.yaml` is rendered
+  from the matching `.tmpl` by `render-verify-config.sh`, which `restart.sh`
+  calls automatically. Verify *generates* client ids, so a rebuilt tenant
+  invalidates any committed id. Edit the `.tmpl`; the rendered file is
+  gitignored and overwritten on every Verify run.
+- **Needs a tenant and a secret.** Copy `.env.verify.example` to `.env.verify`
+  and fill in `VERIFY_GATEWAY_CLIENT_SECRET`. The tenant URL and exchange
+  client id default to `post_deploy_variables.json`.
+- **Scenario 11 stays on Keycloak.** The CIBA plugin still points at Keycloak,
+  and the tenant blocks the grant besides (no `manager` claim). Scenario 10 is
+  under-threshold so it never reaches the plugin and passes either way.
+
+Two deltas change what can honestly be narrated on the Verify path, both
+properties of the tenant rather than the gateway, and neither changes a scenario
+outcome. They are documented at the top of each `policy-verify-*.yaml.tmpl`:
+`aud` is client-bound rather than request-scoped (say "exchanged token," not
+"audience-scoped token"), and the `search_repos` permissions check is a scope
+echo rather than an entitlement decision.
 
 ## Assertions: what the upstream is told
 
@@ -566,12 +621,16 @@ the padding, so the wire stays correct. This is documented in the filter source.
 | `policy-cel.yaml` | CEL variant: `search_repos` uses an inline `cel:` expression |
 | `praxis-opa.yaml` | Same listener as `praxis.yaml`, loads `policy-opa.yaml`. Run via `GATEWAY_CONFIG=praxis-opa.yaml` |
 | `policy-opa.yaml` | OPA variant: a Rego module under `pdp:`, queried by `search_repos` with `opa: { query }` |
+| `praxis-verify-{cedar,cel,opa}.yaml` | IBM Verify listeners, one per PDP. Run via `USE_VERIFY=true GATEWAY_CONFIG=...` (see "Swapping the IdP") |
+| `policy-verify-{cedar,cel,opa}.yaml.tmpl` | Verify policy documents. **Edit these**, not the rendered `.yaml` — the tenant URL and exchange client id are substituted in |
+| `render-verify-config.sh` | Render one or all Verify policy documents from their templates. `restart.sh` calls it automatically; `--check` fails if any is stale |
+| `.env.verify.example` | Template for `.env.verify`, which carries `VERIFY_GATEWAY_CLIENT_SECRET` (gitignored — a live tenant credential) |
 | `docker-compose.yml` | Keycloak (8081), hr-mcp (9100), valkey (6379), and auth-channel (5001) |
 | `keycloak/realm-export.json` | Realm with users, clients, STE v2, and CIBA + the channel SPI |
 | `hr-mcp-server/` | Python mock MCP server (Dockerfile and `server.py`), incl. `adjust_compensation` and the `/_requests` recorder the scenarios assert against |
 | `auth-channel/` | CIBA approval UI (`:5001`, "the manager's phone") for Approve / Deny; dev `/pending` + `/approve` API for scripted approval |
 | `scenarios/*.sh` | The twelve scenarios (08/09 session taint, 10/11 manager approval, 12 assertions) and `_lib.sh` helpers plus its `expect_*` assertions |
-| `run-scenarios.sh` | Run every scenario, optionally across all three PDP configs, and report pass/fail |
+| `run-scenarios.sh` | Run every scenario, optionally across all three PDP configs (`--all-configs`, Keycloak or Verify per `USE_VERIFY`), and report pass/fail |
 | `mint-token.sh` | Mint a user or client token via Keycloak |
 | `verify-token-exchange.sh` | Check that STE v2 is configured correctly |
 | `walkthrough.sh` | Narrated tour of the core scenarios |
